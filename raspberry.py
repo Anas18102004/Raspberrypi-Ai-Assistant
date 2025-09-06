@@ -17,8 +17,8 @@ import subprocess
 
 # Load API Keys
 # NOTE: The API keys are provided in the environment and should not be modified.
-GEMINI_API_KEY = "AIzaSyDv1L2wgiR_FutCZFEeI_LcM15Ef0TUrY4"
-DEEPGRAM_API_KEY = "ea93e67373ea77124ea2cb531678c691f289c714"
+GEMINI_API_KEY = 
+DEEPGRAM_API_KEY = "
 
 # Initialize clients
 client = genai.Client(api_key=GEMINI_API_KEY)
