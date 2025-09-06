@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Assistant - Lip Sync</title>
+  <style>
+    :root {
+      --bg: #0b1020;
+      --card: #121934;
+      --text: #e7ecff;
+      --accent: #7aa2ff;
+      --muted: #9aa4c7;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      background: radial-gradient(1200px 800px at 80% -10%, #1b244a 0%, transparent 70%),
+                  radial-gradient(900px 600px at 0% 100%, #18224a 0%, transparent 70%),
+                  var(--bg);
+      color: var(--text);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-height: 100vh;
+    }
+
+    header {
+      padding: 20px clamp(16px, 4vw, 40px);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 700;
+      letter-spacing: 0.4px;
+    }
+    .brand .dot {
+      width: 12px; height: 12px; border-radius: 50%;
+      background: linear-gradient(135deg, #6cf, #8af);
+      box-shadow: 0 0 18px rgba(122,162,255,.8);
+    }
+
+    main {
+      display: grid;
+      place-items: center;
+      padding: 24px clamp(16px, 4vw, 40px);
+    }
+
+    .card {
+      width: min(100%, 920px);
+      background: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.02));
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.06);
+      overflow: hidden;
+    }
+
+    .card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 14px 16px;
+      border-bottom: 1px solid rgba(255,255,255,.08);
+      background: linear-gradient(180deg, rgba(10,15,35,.6), rgba(10,15,35,.3));
+    }
+
+    .title {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 600;
+    }
+    .badge {
+      font-size: 12px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(122,162,255,.18);
+      color: var(--accent);
+      border: 1px solid rgba(122,162,255,.25);
+    }
+
+    .video-wrap {
+      position: relative;
+      aspect-ratio: 16 / 9;
+      background: #0a0f24;
+      display: grid;
+      place-items: center;
+    }
+
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      background: #000;
+    }
+
+    footer {
+      padding: 16px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+  </style>
+</head>
+  <body>
+    <video
+      id="animation"
+      autoplay
+      loop
+      muted
+      playsinline
+      webkit-playsinline
+      preload="auto"
+      style="position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;background:#000;"
+    >
+      <source src="Lip Sync.mp4" type="video/mp4" />
+    </video>
+    <script>
+      (function () {
+        const v = document.getElementById('animation');
+        if (!v) return;
+        const tryPlay = () => v.play().catch((e) => console.debug('Autoplay blocked or play error:', e?.message || e));
+        // Try immediately, then when enough data is loaded
+        tryPlay();
+        v.addEventListener('canplay', tryPlay, { once: true });
+        v.addEventListener('loadeddata', tryPlay, { once: true });
+        // If blocked, a first tap/click will trigger playback
+        window.addEventListener('pointerdown', tryPlay, { once: true });
+        document.addEventListener('visibilitychange', () => {
+          if (!document.hidden) tryPlay();
+        });
+
+        // Basic diagnostics in case it still doesn't play
+        v.addEventListener('error', () => {
+          const err = v.error;
+          console.error('Video error:', err && (err.message || err.code));
+        });
+        v.addEventListener('loadedmetadata', () => console.debug('Video metadata loaded'));
+        v.addEventListener('waiting', () => console.debug('Video waiting for data'));
+        v.addEventListener('playing', () => console.debug('Video started playing'));
+      })();
+    </script>
+  </body>
+</html>

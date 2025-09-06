@@ -11,9 +11,14 @@ import tempfile
 import threading
 import time
 import wave
+import webbrowser
+from pathlib import Path
+import http.server
+import socketserver
+import socket
 
 # Load API Keys
-GEMINI_API_KEY = "AIzaSyBc89hrVm5LLW5gxxVHeKb69Ys5PPk_J50"
+GEMINI_API_KEY = "AIzaSyDv1L2wgiR_FutCZFEeI_LcM15Ef0TUrY4"
 DEEPGRAM_API_KEY = "ea93e67373ea77124ea2cb531678c691f289c714"
 
 client = genai.Client(api_key=GEMINI_API_KEY)
@@ -23,6 +28,15 @@ deepgram = DeepgramClient(DEEPGRAM_API_KEY)
 cap = None
 latest_frame = None
 is_listening = False
+httpd = None
+server_thread = None
+server_port = None
+
+# Global instruction for the model to avoid referencing images unless provided
+SYSTEM_PROMPT = (
+    "You are a helpful assistant. If an image is provided, use it for grounded answers. "
+    "If no image is provided, answer strictly based on the user's text and do not mention any image or visuals."
+)
 
 # -----------------------------
 # CAMERA FUNCTIONS
@@ -81,6 +95,31 @@ def cleanup_camera():
         cap.release()
     cv2.destroyAllWindows()
 
+def start_static_server(directory: str = "frontend", preferred_port: int = 8000) -> int:
+    """Start a background HTTP server serving the given directory. Returns the chosen port."""
+    global httpd, server_thread, server_port
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            # Serve files from the specified directory
+            super().__init__(*args, directory=directory, **kwargs)
+
+        def log_message(self, format, *args):
+            # Quieter logs
+            pass
+
+    # Try preferred port; if busy, let OS choose a free one
+    addr = ("127.0.0.1", preferred_port)
+    try:
+        httpd = socketserver.ThreadingTCPServer(addr, Handler)
+    except OSError:
+        httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+
+    server_port = httpd.server_address[1]
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    return server_port
+
 # -----------------------------
 # SEND IMAGE TO GEMINI
 # -----------------------------
@@ -91,13 +130,16 @@ def ask_gemini(img_path, question="What do you see?"):
     
     response = client.models.generate_content(
         model="gemini-1.5-flash",
-        contents=[{
-            "role": "user",
-            "parts": [
-                {"text": question},
-                {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}
-            ],
-        }]
+        contents=[
+            {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
+            {
+                "role": "user",
+                "parts": [
+                    {"text": question},
+                    {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}},
+                ],
+            },
+        ]
     )
     
     # Handle different possible response structures
@@ -117,6 +159,63 @@ def ask_gemini(img_path, question="What do you see?"):
     except Exception as e:
         print(f"Error parsing Gemini response: {e}")
         return "Sorry, there was an error processing the image."
+
+# -----------------------------
+# TEXT-ONLY ASK GEMINI
+# -----------------------------
+def ask_gemini_text(question: str):
+    """Call Gemini with text only, instructing it not to reference any image."""
+    response = client.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=[
+            {"role": "user", "parts": [{"text": SYSTEM_PROMPT}]},
+            {"role": "user", "parts": [{"text": question}]},
+        ]
+    )
+
+    try:
+        if hasattr(response, 'text'):
+            return response.text
+        elif hasattr(response, 'candidates') and response.candidates:
+            if hasattr(response.candidates[0], 'content'):
+                return response.candidates[0].content.parts[0].text
+            elif hasattr(response.candidates[0], 'text'):
+                return response.candidates[0].text
+        else:
+            response_str = str(response)
+            print(f"Debug - Text response structure: {response_str[:200]}...")
+            return "Sorry, I couldn't process your question."
+    except Exception as e:
+        print(f"Error parsing Gemini text response: {e}")
+        return "Sorry, there was an error processing your question."
+
+# -----------------------------
+# INTENT DETECTION: DOES THIS NEED AN IMAGE?
+# -----------------------------
+def needs_image(question: str) -> bool:
+    """Heuristic to decide if the user's question likely needs the camera image."""
+    if not question:
+        return False
+    q = question.lower().strip()
+
+    # If the question explicitly mentions visual/scene/object/this, assume vision
+    visual_keywords = [
+        "see", "look", "this", "that", "these", "those", "image", "picture", "photo", "screen",
+        "object", "identify", "recognize", "detect", "describe", "what is in", "what's in",
+        "color", "shape", "text on", "read this", "showing", "frame"
+    ]
+    for kw in visual_keywords:
+        if kw in q:
+            return True
+
+    # Generic small talk or knowledge questions do not need image
+    small_talk = ["how are you", "who are you", "what's your name", "what is your name", "hello", "hi", "hey"]
+    for st in small_talk:
+        if st in q:
+            return False
+
+    # Default: no image unless clearly requested
+    return False
 
 # -----------------------------
 # SPEECH TO TEXT (STT) - Fixed for Deepgram v4.0.0+
@@ -283,26 +382,28 @@ def process_voice_command():
             print("❌ No clear question detected. Try again.")
             return
         
-        # Step 2: Capture the current frame
-        img_path = save_current_frame()
-        if not img_path:
-            print("❌ Failed to capture image")
-            return
-        
-        print(f"📸 Image captured for question: '{user_question}'")
-        
-        # Step 3: Send question + image to Gemini
-        print("🤖 Processing with Gemini...")
-        answer = ask_gemini(img_path, user_question)
+        if needs_image(user_question):
+            # Step 2 (vision): Capture the current frame
+            img_path = save_current_frame()
+            if not img_path:
+                print("❌ Failed to capture image")
+                return
+            print(f"📸 Image captured for question: '{user_question}'")
+            print("🤖 Processing with Gemini (vision)...")
+            answer = ask_gemini(img_path, user_question)
+            # Clean up
+            if os.path.exists(img_path):
+                os.remove(img_path)
+        else:
+            # Text-only path
+            print("📝 Text-only question detected — skipping image capture")
+            print("🤖 Processing with Gemini (text)...")
+            answer = ask_gemini_text(user_question)
         print(f"🤖 Gemini: {answer}")
         
-        # Step 4: Speak the response
+        # Step 3/4: Speak the response
         speak(answer)
         
-        # Clean up
-        if os.path.exists(img_path):
-            os.remove(img_path)
-            
     except Exception as e:
         print(f"Error processing voice command: {e}")
 
@@ -342,6 +443,14 @@ def voice_monitoring_loop():
 def main():
     try:
         print("🚀 Starting Voice-Activated Camera Assistant...")
+        # Start local static server for reliable autoplay and open browser
+        try:
+            port = start_static_server(directory="frontend", preferred_port=8000)
+            url = f"http://127.0.0.1:{port}/index.html"
+            webbrowser.open(url, new=1)
+            print(f"🌐 Opened browser at: {url}")
+        except Exception as e:
+            print(f"⚠️ Could not start static server or open browser automatically: {e}")
         
         # Initialize camera
         initialize_camera()
@@ -363,6 +472,13 @@ def main():
         print(f"Error in main: {e}")
     finally:
         cleanup_camera()
+        # Stop the HTTP server if running
+        try:
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
+        except Exception:
+            pass
         print("👋 Program ended")
 
 if __name__ == "__main__":
