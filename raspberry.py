@@ -12,9 +12,9 @@ import threading
 import time
 import wave
 
-# Load API Keys
-GEMINI_API_KEY = "AIzaSyBc89hrVm5LLW5gxxVHeKb69Ys5PPk_J50"
-DEEPGRAM_API_KEY = "ea93e67373ea77124ea2cb531678c691f289c714"
+# Load API Key
+GEMINI_API_KEY = 
+DEEPGRAM_API_KEY = 
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 deepgram = DeepgramClient(DEEPGRAM_API_KEY)
