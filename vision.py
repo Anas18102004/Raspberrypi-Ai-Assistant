@@ -18,8 +18,8 @@ import socketserver
 import socket
 
 # Load API Keys
-GEMINI_API_KEY = "AIzaSyDv1L2wgiR_FutCZFEeI_LcM15Ef0TUrY4"
-DEEPGRAM_API_KEY = "ea93e67373ea77124ea2cb531678c691f289c714"
+GEMINI_API_KEY = 
+DEEPGRAM_API_KEY = 
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 deepgram = DeepgramClient(DEEPGRAM_API_KEY)
