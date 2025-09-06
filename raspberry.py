@@ -11,10 +11,15 @@ import tempfile
 import threading
 import time
 import wave
+import webbrowser
+from pathlib import Path
+import http.server
+import socketserver
+import socket
 
-# Load API Key
-GEMINI_API_KEY = 
-DEEPGRAM_API_KEY = 
+# Load API Keys
+GEMINI_API_KEY = "AIzaSyDv1L2wgiR_FutCZFEeI_LcM15Ef0TUrY4"
+DEEPGRAM_API_KEY = "ea93e67373ea77124ea2cb531678c691f289c714"
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 deepgram = DeepgramClient(DEEPGRAM_API_KEY)
@@ -23,6 +28,9 @@ deepgram = DeepgramClient(DEEPGRAM_API_KEY)
 cap = None
 latest_frame = None
 is_listening = False
+httpd = None
+server_thread = None
+server_port = None
 
 # -----------------------------
 # CAMERA FUNCTIONS
@@ -54,7 +62,7 @@ def camera_loop():
         latest_frame = frame.copy()
         
         # Add status text overlay
-        status_text = "🎙️ LISTENING..." if is_listening else "💬 Say something to ask about what you see"
+        status_text = "🎙 LISTENING..." if is_listening else "💬 Say something to ask about what you see"
         cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
         cv2.putText(frame, "Press 'q' to quit", (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
         
@@ -81,42 +89,55 @@ def cleanup_camera():
         cap.release()
     cv2.destroyAllWindows()
 
-# -----------------------------
-# SEND IMAGE TO GEMINI
-# -----------------------------
-def ask_gemini(img_path, question="What do you see?"):
-    with open(img_path, "rb") as f:
-        img_bytes = f.read()
-    img_b64 = base64.b64encode(img_bytes).decode("utf-8")
-    
-    response = client.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=[{
-            "role": "user",
-            "parts": [
-                {"text": question},
-                {"inline_data": {"mime_type": "image/jpeg", "data": img_b64}}
-            ],
-        }]
-    )
-    
-    # Handle different possible response structures
+def start_static_server(directory: str = "frontend", preferred_port: int = 8000) -> int:
+    """Start a background HTTP server serving the given directory. Returns the chosen port."""
+    global httpd, server_thread, server_port
+
+    class Handler(http.server.SimpleHTTPRequestHandler):
+        def _init_(self, *args, **kwargs):
+            # Serve files from the specified directory
+            super()._init_(*args, directory=directory, **kwargs)
+
+        def log_message(self, format, *args):
+            # Quieter logs
+            pass
+
+    # Try preferred port; if busy, let OS choose a free one
+    addr = ("127.0.0.1", preferred_port)
     try:
-        if hasattr(response, 'text'):
+        httpd = socketserver.ThreadingTCPServer(addr, Handler)
+    except OSError:
+        httpd = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Handler)
+
+    server_port = httpd.server_address[1]
+    server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    server_thread.start()
+    return server_port
+
+# -----------------------------
+# GEMINI - TEXT ONLY (NO VISION)
+# -----------------------------
+def ask_gemini_text(prompt: str) -> str:
+    """Send plain text to Gemini and return the response text."""
+    try:
+        response = client.models.generate_content(
+            model="gemini-1.5-flash",
+            contents=[{"role": "user", "parts": [{"text": prompt}]}]
+        )
+
+        if hasattr(response, 'text') and response.text:
             return response.text
         elif hasattr(response, 'candidates') and response.candidates:
-            if hasattr(response.candidates[0], 'content'):
-                return response.candidates[0].content.parts[0].text
-            elif hasattr(response.candidates[0], 'text'):
-                return response.candidates[0].text
-        else:
-            # Fallback: convert response to string and extract text
-            response_str = str(response)
-            print(f"Debug - Response structure: {response_str[:200]}...")
-            return "Sorry, I couldn't process the image response."
+            cand = response.candidates[0]
+            if hasattr(cand, 'content') and cand.content and cand.content.parts:
+                return cand.content.parts[0].text
+            if hasattr(cand, 'text') and cand.text:
+                return cand.text
+        # Fallback
+        return "I'm not sure how to respond to that."
     except Exception as e:
-        print(f"Error parsing Gemini response: {e}")
-        return "Sorry, there was an error processing the image."
+        print(f"Error calling Gemini (text): {e}")
+        return "There was an error contacting the AI service."
 
 # -----------------------------
 # SPEECH TO TEXT (STT) - Fixed for Deepgram v4.0.0+
@@ -125,7 +146,7 @@ def record_and_transcribe():
     global is_listening
     is_listening = True
     
-    print("\n🎙️ Listening for 5 seconds...")
+    print("\n🎙 Listening for 5 seconds...")
     duration = 5  # seconds
     fs = 16000
     audio = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype="int16")
@@ -274,35 +295,25 @@ def speak(text):
 # VOICE COMMAND PROCESSING
 # -----------------------------
 def process_voice_command():
-    """Record audio, transcribe, capture image, and get AI response"""
+    """Record audio, transcribe, and get AI response (text-only)."""
     try:
         # Step 1: Record and transcribe user question
         user_question = record_and_transcribe()
-        
+
         if not user_question or len(user_question.strip()) < 3:
             print("❌ No clear question detected. Try again.")
             return
-        
-        # Step 2: Capture the current frame
-        img_path = save_current_frame()
-        if not img_path:
-            print("❌ Failed to capture image")
-            return
-        
-        print(f"📸 Image captured for question: '{user_question}'")
-        
-        # Step 3: Send question + image to Gemini
-        print("🤖 Processing with Gemini...")
-        answer = ask_gemini(img_path, user_question)
+
+        print(f"🗣 You asked: '{user_question}'")
+
+        # Step 2: Send question text to Gemini (no image)
+        print("🤖 Processing with Gemini (text-only)...")
+        answer = ask_gemini_text(user_question)
         print(f"🤖 Gemini: {answer}")
-        
-        # Step 4: Speak the response
+
+        # Step 3: Speak the response
         speak(answer)
-        
-        # Clean up
-        if os.path.exists(img_path):
-            os.remove(img_path)
-            
+
     except Exception as e:
         print(f"Error processing voice command: {e}")
 
@@ -310,25 +321,20 @@ def process_voice_command():
 # CONTINUOUS VOICE MONITORING
 # -----------------------------
 def voice_monitoring_loop():
-    """Continuously monitor for voice commands"""
+    """Continuously monitor for voice commands (no camera dependency)."""
     print("\n🎯 Voice monitoring started!")
     print("💡 Tips:")
-    print("   - Ask questions like: 'What is this?', 'Explain this object', 'What do you see?'")
-    print("   - Speak clearly for 5 seconds when the microphone activates")
-    print("   - Press 'q' in the camera window to quit\n")
-    
+    print("   - Ask questions like: 'What's the weather?', 'Tell me a joke', 'Explain quantum computing' ")
+    print("   - Speak clearly for 5 seconds when the microphone activates\n")
+
     while True:
         try:
-            # Wait a moment between voice detections
+            # Wait a moment between interactions
             time.sleep(2)
-            
-            # Check if camera is still running
-            if cap is None or not cap.isOpened():
-                break
-            
+
             # Process voice command
             process_voice_command()
-            
+
         except KeyboardInterrupt:
             print("\n🛑 Voice monitoring stopped by user")
             break
@@ -341,29 +347,33 @@ def voice_monitoring_loop():
 # -----------------------------
 def main():
     try:
-        print("🚀 Starting Voice-Activated Camera Assistant...")
-        
-        # Initialize camera
-        initialize_camera()
-        print("📹 Camera initialized")
-        
-        # Start camera display in a separate thread
-        camera_thread = threading.Thread(target=camera_loop, daemon=True)
-        camera_thread.start()
-        
-        # Small delay to let camera start
-        time.sleep(1)
-        
+        print("🚀 Starting Voice-Activated Assistant (Text-Only Mode)...")
+        # Start local static server for reliable autoplay and open browser
+        try:
+            port = start_static_server(directory="frontend", preferred_port=8000)
+            url = f"http://127.0.0.1:{port}/index.html"
+            webbrowser.open(url, new=1)
+            print(f"🌐 Opened browser at: {url}")
+        except Exception as e:
+            print(f"⚠ Could not start static server or open browser automatically: {e}")
+
         # Start voice monitoring (this will run in main thread)
         voice_monitoring_loop()
-        
+
     except KeyboardInterrupt:
         print("\n🛑 Program stopped by user")
     except Exception as e:
         print(f"Error in main: {e}")
     finally:
-        cleanup_camera()
+        cleanup_camera()  # Safe to call even if camera wasn't used
+        # Stop the HTTP server if running
+        try:
+            if httpd is not None:
+                httpd.shutdown()
+                httpd.server_close()
+        except Exception:
+            pass
         print("👋 Program ended")
 
-if __name__ == "__main__":
+if _name_ == "_main_":
     main()
