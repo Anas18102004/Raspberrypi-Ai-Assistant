@@ -1,271 +1,105 @@
-import os
-import asyncio
-import json
-import requests
-from typing import Optional, Type, Dict, Any
-from datetime import datetime
-from dotenv import load_dotenv
-import google.generativeai as genai
-from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
 import sounddevice as sd
 import numpy as np
+import requests
+import json
+import time
+import asyncio
+from scipy.io.wavfile import write
+from deepgram import Deepgram
+import google.generativeai as genai
 from gtts import gTTS
-import tempfile
-import pygame
-from enum import Enum
-from pydantic import BaseModel, Field
-from langchain.agents import Tool, AgentExecutor, create_structured_chat_agent
-from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.tools import BaseTool
-from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.agents.format_scratchpad import format_to_openai_function_messages
-from langchain.agents.output_parsers import OpenAIFunctionsAgentOutputParser
+import os
 
-# Load environment variables
-load_dotenv()
+# ---------------- CONFIGURATION ----------------
+GEMINI_API_KEY = "AIzaSyDv1L2wgiR_FutCZFEeI_LcM15Ef0TUrY4"
+DEEPGRAM_API_KEY = "ea93e67373ea77124ea2cb531678c691f289c714"
+OPENWEATHER_API_KEY = "1e613ff478e4a523cb3121caa909080a"
+CITY_NAME = "Ahmedabad,IN"  # city, country code
 
-# Initialize APIs
-gemini_api_key = os.getenv("GEMINI_API_KEY")
-deepgram_api_key = os.getenv("DEEPGRAM_API_KEY")
-openweather_api_key = os.getenv("OPENWEATHER_API_KEY")  # Add your OpenWeather API key
+# Initialize Gemini client
+genai.configure(api_key=GEMINI_API_KEY)
+gemini = genai.GenerativeModel('gemini-1.5-flash')
 
-genai.configure(api_key=gemini_api_key)
-deepgram = DeepgramClient(api_key=deepgram_api_key)
+# Define weather-related keywords
+weather_keywords = ["weather","whether" ,"forecast", "temperature", "climate", "rain", "sunny", "humidity", "wind"]
 
-# Initialize pygame for audio playback
-pygame.mixer.init()
+# Audio settings
+DURATION = 5  # seconds of recording
+FS = 44100   # sampling rate
 
-class DeviceState(Enum):
-    IDLE = "idle"
-    LISTENING = "listening"
-    PROCESSING = "processing"
-    SPEAKING = "speaking"
+# ---------------- RECORD AUDIO ----------------
+def record_audio():
+    print("Listening...")
+    recording = sd.rec(int(DURATION * FS), samplerate=FS, channels=1, dtype=np.int16)
+    sd.wait()
+    filename = "voice.wav"
+    write(filename, FS, recording)
+    print("Recording complete")
+    return filename
 
-class VoiceAssistant:
-    def __init__(self):
-        self.state = DeviceState.IDLE
-        self.llm = ChatGoogleGenerativeAI(
-            model="gemini-pro",
-            temperature=0.7,
-            google_api_key=gemini_api_key
-        )
-        self.tools = self._setup_tools()
-        self.agent = self._setup_agent()
-        self.dg_connection = None
-        self.sample_rate = 16000
-        self.channels = 1
-        self.is_running = False
+# ---------------- DEEPGRAM STT ----------------
+async def transcribe_audio(file_path):
+    dg_client = Deepgram(DEEPGRAM_API_KEY)
 
-    def _setup_tools(self):
-        # Weather Tool
-        class WeatherInput(BaseModel):
-            location: str = Field(description="The city and state/country, e.g., 'San Francisco, US'")
+    with open(file_path, 'rb') as f:
+        audio_bytes = f.read()
 
-        def get_weather(location: str) -> str:
-            """Get the current weather for a location."""
-            try:
-                base_url = "http://api.openweathermap.org/data/2.5/weather"
-                params = {
-                    'q': location,
-                    'appid': openweather_api_key,
-                    'units': 'metric'
-                }
-                response = requests.get(base_url, params=params)
-                data = response.json()
-                
-                if response.status_code == 200:
-                    weather = data['weather'][0]['description']
-                    temp = data['main']['temp']
-                    return f"Current weather in {location}: {weather}, Temperature: {temp}°C"
-                else:
-                    return f"Could not get weather data for {location}: {data.get('message', 'Unknown error')}"
-            except Exception as e:
-                return f"Error getting weather: {str(e)}"
+    source = {'buffer': audio_bytes, 'mimetype': 'audio/wav'}
+    options = {'punctuate': True, 'language': 'en-US'}
 
-        # Google Search Tool
-        class SearchInput(BaseModel):
-            query: str = Field(description="search query to look up")
+    response = await dg_client.transcription.prerecorded(source, options)
+    transcript = response['results']['channels'][0]['alternatives'][0].get('transcript', '')
+    print("You said:", transcript)
+    return transcript
 
-        def search_google(query: str) -> str:
-            """Searches Google for the query. Useful for current events or information not in the knowledge base."""
-            try:
-                from googlesearch import search
-                results = list(search(query, num=3, stop=3, pause=2))
-                if results:
-                    return f"Top search results for '{query}':\n" + "\n".join(results)
-                return "No search results found."
-            except Exception as e:
-                return f"Error performing search: {str(e)}"
+# ---------------- WEATHER FUNCTION ----------------
+def get_weather():
+    url = f"http://api.openweathermap.org/data/2.5/weather?q={CITY_NAME}&appid={OPENWEATHER_API_KEY}&units=metric"
+    res = requests.get(url)
+    data = res.json()
+    if data.get("main"):
+        temp = data["main"]["temp"]
+        desc = data["weather"][0]["description"]
+        return f"The current temperature in {CITY_NAME} is {temp}ï¿½C with {desc}."
+    else:
+        return "Sorry, I couldn't retrieve the weather information."
 
-        # Create tool instances
-        weather_tool = Tool(
-            name="get_weather",
-            func=get_weather,
-            description="Useful for getting current weather information for a location.",
-            args_schema=WeatherInput
-        )
-
-        search_tool = Tool(
-            name="search_google",
-            func=search_google,
-            description="Useful for searching the internet for current information.",
-            args_schema=SearchInput
-        )
-
-        return [weather_tool, search_tool]
-
-    def _setup_agent(self):
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", "You are a helpful voice assistant named Krish. Keep your responses concise and natural for speech."),
-            ("human", "{input}"),
-            MessagesPlaceholder(variable_name="agent_scratchpad")
-        ])
-
-        agent = (
-            {
-                "input": lambda x: x["input"],
-                "agent_scratchpad": lambda x: format_to_openai_function_messages(x["intermediate_steps"]),
-            }
-            | prompt
-            | self.llm.bind(functions=[{"name": t.name, "description": t.description, "parameters": t.args} for t in self.tools])
-            | OpenAIFunctionsAgentOutputParser()
-        )
-
-        return AgentExecutor(agent=agent, tools=self.tools, verbose=True)
-
-    async def text_to_speech(self, text: str):
-        """Convert text to speech and play it"""
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
-                tts = gTTS(text=text, lang='en')
-                tts.save(fp.name)
-                
-                pygame.mixer.music.load(fp.name)
-                pygame.mixer.music.play()
-                
-                # Wait for the audio to finish playing
-                while pygame.mixer.music.get_busy():
-                    await asyncio.sleep(0.1)
-                
-                os.unlink(fp.name)
-        except Exception as e:
-            print(f"Error in text_to_speech: {e}")
-
-    async def process_voice_command(self, text: str):
-        """Process the transcribed text and generate a response"""
-        if not text.strip():
-            return "I didn't catch that. Could you please repeat?"
-
-        self.state = DeviceState.PROCESSING
-        
-        try:
-            response = await self.agent.ainvoke({"input": text, "chat_history": []})
-            return response["output"]
-        except Exception as e:
-            print(f"Error processing command: {e}")
-            return "I'm sorry, I encountered an error processing your request."
-        finally:
-            self.state = DeviceState.IDLE
-
-    async def start_voice_loop(self):
-        """Main loop for voice interaction"""
-        self.is_running = True
-        
-        # Configure Deepgram Live Transcription
-        options = LiveOptions(
-            model="nova-2",
-            language="en-US",
-            smart_format=True,
-            encoding="linear16",
-            channels=1,
-            sample_rate=16000,
-            interim_results=True,
-            endpointing=300,
-            utterance_end_ms="1000",
-            vad_events=True,
-        )
-
-        def on_utterance_end(utterance_end, **kwargs):
-            if utterance_end.get('utterance_end'):
-                asyncio.create_task(self._process_utterance())
-
-        def on_transcript(transcript, **kwargs):
-            if 'channel' in transcript and 'alternatives' in transcript['channel']:
-                utterance = transcript['channel']['alternatives'][0].get('transcript', '').strip()
-                if utterance:
-                    print(f"Heard: {utterance}")
-                    self.current_utterance = utterance
-
-        def on_error(error, **kwargs):
-            print(f"Deepgram error: {error}")
-
-        # Start Deepgram connection
-        self.dg_connection = deepgram.listen.live.v("1").start(options)
-        self.dg_connection.on(LiveTranscriptionEvents.Transcript, on_transcript)
-        self.dg_connection.on(LiveTranscriptionEvents.UtteranceEnd, on_utterance_end)
-        self.dg_connection.on(LiveTranscriptionEvents.Error, on_error)
-
-        # Start audio stream
-        self.audio_queue = asyncio.Queue()
-        self.current_utterance = ""
-        
-        def audio_callback(indata, frames, time, status):
-            if status:
-                print(status, flush=True)
-            self.audio_queue.put_nowait(indata.copy())
-
-        stream = sd.RawInputStream(
-            samplerate=self.sample_rate,
-            blocksize=4096,
-            dtype='int16',
-            channels=self.channels,
-            callback=audio_callback
-        )
-
-        with stream:
-            print("Listening... (Press Ctrl+C to stop)")
-            while self.is_running:
-                try:
-                    data = await self.audio_queue.get()
-                    if self.dg_connection and self.dg_connection.is_alive():
-                        self.dg_connection.send(data.tobytes())
-                    await asyncio.sleep(0.01)
-                except asyncio.CancelledError:
-                    break
-                except Exception as e:
-                    print(f"Error in audio loop: {e}")
-
-    async def _process_utterance(self):
-        """Process the completed utterance"""
-        if not self.current_utterance:
-            return
-            
-        self.state = DeviceState.PROCESSING
-        print(f"Processing: {self.current_utterance}")
-        
-        response = await self.process_voice_command(self.current_utterance)
-        print(f"Response: {response}")
-        
-        await self.text_to_speech(response)
-        self.current_utterance = ""
-        self.state = DeviceState.IDLE
-
-    async def stop(self):
-        """Clean up resources"""
-        self.is_running = False
-        if self.dg_connection:
-            await self.dg_connection.finish()
-        pygame.mixer.quit()
-
-async def main():
-    assistant = VoiceAssistant()
+# ---------------- GEMINI Q&A ----------------
+def ask_gemini(question):
     try:
-        await assistant.start_voice_loop()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
-    finally:
-        await assistant.stop()
+        # Check if the question is about weather by matching any keyword
+        if any(word in question.lower() for word in weather_keywords):
+            return get_weather()
+        
+        # Ask Gemini to answer briefly
+        prompt = f"Please answer the following question in 1 or 2 short sentences:\n{question}"
+        response = gemini.generate_content(prompt).text
+        return response
+    except Exception as e:
+        print("Error:", e)
+        return "Sorry, I couldn't process that."
+
+# ---------------- TEXT TO SPEECH ----------------
+def speak(text):
+    print("Assistant:", text)
+    tts = gTTS(text=text, lang='en')
+    filename = "response.mp3"
+    tts.save(filename)
+    os.system(f"mpg123 {filename}")  # Ensure mpg123 is installed or use another player
+
+# ---------------- MAIN LOOP ----------------
+async def main():
+    while True:
+        audio_file = record_audio()
+        text = await transcribe_audio(audio_file)
+        if text.strip() == "":
+            print("Didn't catch that.")
+            continue
+        if "exit" in text.lower() or "quit" in text.lower():
+            print("Goodbye!")
+            break
+        answer = ask_gemini(text)
+        speak(answer)
 
 if __name__ == "__main__":
     asyncio.run(main())
