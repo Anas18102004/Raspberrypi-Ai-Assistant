@@ -7,15 +7,15 @@ from scipy.io.wavfile import write
 from deepgram import Deepgram
 import google.generativeai as genai
 from gtts import gTTS
-#from playsound import playsound
+from playsound import playsound
 
 # ---------------- CONFIGURATION ----------------
 # Set up your API keys here.
 # IMPORTANT: In a production environment, you should load these from environment variables
 # for security instead of hardcoding them.
-GEMINI_API_KEY =
-DEEPGRAM_API_KEY = 
-WEATHER_API_KEY = 
+GEMINI_API_KEY = "AIzaSyDv1L2wgiR_FutCZFEeI_LcM15Ef0TUrY4"
+DEEPGRAM_API_KEY = "ea93e67373ea77124ea2cb531678c691f289c714"
+WEATHER_API_KEY = "53cea54c7ec545719c2151516250809"
 CITY_NAME = "Ahmedabad,IN"  # Change to your desired city and country code
 
 # Define the keywords that will trigger the weather function.
@@ -52,8 +52,12 @@ def speak(text):
     tts = gTTS(text=text, lang='en')
     filename = "response.mp3"
     tts.save(filename)
-    #playsound(filename)  # Play the saved audio file.
-    os.remove(filename)  # Clean up the audio file after playing.
+    try:
+        playsound(filename)  # Play the saved audio file.
+    except Exception as e:
+        print(f"Error playing sound: {e}")
+    finally:
+        os.remove(filename)  # Clean up the audio file after playing.
 
 # ---------------- API FUNCTIONS ----------------
 async def transcribe_audio(file_path):
