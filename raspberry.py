@@ -1,244 +1,395 @@
-import sounddevice as sd
-import numpy as np
-import requests
 import asyncio
 import os
 import json
-import websockets
+import requests
+import sounddevice as sd
+import numpy as np
 import google.generativeai as genai
-from elevenlabs import play, stream, Voice, VoiceSettings
-import RPi.GPIO as GPIO
 import time
-from RPLCD.i2c import CharLCD
+import logging
+from dotenv import load_dotenv
+from datetime import datetime
+import wave
+import io
+from gtts import gTTS
+import pygame
+from io import BytesIO
 
-# ---------------- CONFIGURATION ----------------
-# Use environment variables for secure API key access
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+# Load environment variables
+load_dotenv()
 
-CITY_NAME = "Ahmedabad,IN"
-WEATHER_KEYWORDS = ["weather", "forecast", "temperature", "climate", "rain", "sunny", "humidity", "wind"]
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-FS = 44100
-CHANNELS = 1
-BLOCK_SIZE = 1024  # Smaller blocks for lower latency
+class FastConfig:
+    # API Keys
+    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+    OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+    DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
-# ---------------- GPIO & LCD SETUP ----------------
-LED_BLUE = 21
-LED_WHITE = 20
-LED_R5 = 25
-LED_E = 24
-LED_D4 = 23
-LED_D5 = 17
-LED_D6 = 18
-LED_D7 = 22
+    # Basic Config
+    CITY_NAME = os.getenv("CITY_NAME", "Ahmedabad,IN")
+    ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "21m00Tcm4TlvDq8ikWAM")
+    
+    # Performance Settings
+    DEEPGRAM_SAMPLE_RATE = 16000
+    RECORDING_DURATION = 5  # seconds to record
+    
+    # Ultra-fast TTS settings
+    ELEVENLABS_FAST_MODEL = "eleven_flash_v2_5"
+    
+    # Keywords for fast responses
+    WEATHER_KEYWORDS = ["weather", "forecast", "temperature", "climate", "rain", "sunny"]
+    TIME_KEYWORDS = ["time", "clock", "hour", "minute", "date", "day", "today"]
+    
+    @classmethod
+    def validate(cls):
+        required_keys = {
+            "ELEVENLABS_API_KEY": cls.ELEVENLABS_API_KEY,
+            "DEEPGRAM_API_KEY": cls.DEEPGRAM_API_KEY,
+            "GEMINI_API_KEY": cls.GEMINI_API_KEY
+        }
+        
+        missing_keys = [name for name, key in required_keys.items() if not key]
+        if missing_keys:
+            logger.error("Missing API keys!")
+            for key in missing_keys:
+                logger.error(f"   {key}=your_key_here")
+            raise ValueError(f"Missing keys: {', '.join(missing_keys)}")
+        logger.info("✅ All API keys validated")
 
-ALL_LEDS = [LED_BLUE, LED_WHITE, LED_R5, LED_E, LED_D4, LED_D5, LED_D6, LED_D7]
+# Validate config
+FastConfig.validate()
 
-GPIO.setmode(GPIO.BCM)
-for led in ALL_LEDS:
-    GPIO.setup(led, GPIO.OUT)
-    GPIO.output(led, GPIO.LOW)
-
-lcd = CharLCD(i2c_expander='PCF8574', address=0x27, port=1, cols=16, rows=2, dotsize=8,
-              charmap='A02', auto_linebreaks=True)
-
-# ---------------- INITIALIZATION ----------------
-if not all([GEMINI_API_KEY, DEEPGRAM_API_KEY, ELEVENLABS_API_KEY, OPENWEATHER_API_KEY]):
-    raise ValueError("One or more API keys are not set as environment variables.")
-
-genai.configure(api_key=GEMINI_API_KEY)
+# Initialize APIs
+genai.configure(api_key=FastConfig.GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel('gemini-1.5-flash')
-ELEVENLABS_VOICE_ID = "YOUR_ELEVENLABS_VOICE_ID" # You can find this in your ElevenLabs account
 
-# ---------------- UTILITY FUNCTIONS ----------------
-def turn_on(led):
-    GPIO.output(led, GPIO.HIGH)
+# ElevenLabs setup
+try:
+    from elevenlabs import ElevenLabs, VoiceSettings
+    client = ElevenLabs(api_key=FastConfig.ELEVENLABS_API_KEY)
+    logger.info("✅ ElevenLabs initialized")
+except ImportError as e:
+    logger.error(f"ElevenLabs error: {e}")
+    exit(1)
 
-def turn_off(led):
-    GPIO.output(led, GPIO.LOW)
-
-def all_leds_off():
-    for led in ALL_LEDS:
-        GPIO.output(led, GPIO.LOW)
-
-def indicate_listening():
-    all_leds_off()
-    turn_on(LED_BLUE)
-
-def indicate_processing():
-    all_leds_off()
-    turn_on(LED_WHITE)
-
-def indicate_error():
-    all_leds_off()
-    turn_on(LED_R5)
-    time.sleep(2)
-    turn_off(LED_R5)
-
-def display_weather(temp, condition):
-    lcd.clear()
-    lcd.write_string("Weather:")
-    lcd.crlf()
-    message = f"{temp:.1f}C, {condition}"
-    lcd.write_string(message[:16])
-
-def clear_display():
-    lcd.clear()
-
-def display_weather_on_leds(temp):
-    all_leds_off()
-    temp_ranges = [10, 15, 20, 25, 30, 35, 40, 45]
-    for i, threshold in enumerate(temp_ranges):
-        if temp >= threshold:
-            turn_on(ALL_LEDS[i])
-        else:
-            break
-
-# ---------------- API FUNCTIONS ----------------
-def speak(text):
-    """Uses ElevenLabs streaming API for low-latency TTS."""
-    print("Assistant:", text)
-    try:
-        audio_stream = play(
-            text=text,
-            voice=Voice(voice_id=ELEVENLABS_VOICE_ID, settings=VoiceSettings(stability=0.5, similarity_boost=0.75)),
-            stream=True
-        )
-        for chunk in audio_stream:
-            # The play function handles streaming playback automatically
-            pass 
+class UltraFastAssistant:
+    def __init__(self):
+        self.cached_weather = None
+        self.last_weather_update = 0
+        self.weather_cache_duration = 300  # 5 minutes
         
-    except Exception as e:
-        print(f"Error during ElevenLabs TTS: {e}")
-        indicate_error()
+        logger.info("🚀 Ultra-Fast Assistant Ready!")
 
-def get_weather_data(city_name, api_key):
-    """Fetches real-time weather data from OpenWeatherMap."""
-    base_url = "http://api.openweathermap.org/data/2.5/weather?"
-    complete_url = f"{base_url}q={city_name}&appid={api_key}&units=metric"
-    try:
-        response = requests.get(complete_url, timeout=5)
-        response.raise_for_status()
-        data = response.json()
-        if data["cod"] == 200:
-            temp = data["main"]["temp"]
-            condition = data["weather"][0]["description"]
-            return {"temperature_celsius": temp, "condition": condition}
-        else:
+    def record_audio_simple(self):
+        """Simple audio recording - no streaming"""
+        logger.info("🎙️ Recording... speak now!")
+        
+        try:
+            # Record audio
+            audio_data = sd.rec(
+                int(FastConfig.RECORDING_DURATION * FastConfig.DEEPGRAM_SAMPLE_RATE),
+                samplerate=FastConfig.DEEPGRAM_SAMPLE_RATE,
+                channels=1,
+                dtype=np.int16
+            )
+            
+            # Show countdown
+            for i in range(FastConfig.RECORDING_DURATION, 0, -1):
+                print(f"Recording... {i}", end='\r')
+                time.sleep(1)
+            
+            sd.wait()  # Wait for recording to finish
+            print("Recording complete!   ")
+            
+            # Convert to WAV format
+            wav_buffer = io.BytesIO()
+            with wave.open(wav_buffer, 'wb') as wav_file:
+                wav_file.setnchannels(1)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(FastConfig.DEEPGRAM_SAMPLE_RATE)
+                wav_file.writeframes(audio_data.tobytes())
+            
+            return wav_buffer.getvalue()
+            
+        except Exception as e:
+            logger.error(f"Recording error: {e}")
             return None
-    except requests.exceptions.RequestException as e:
-        print(f"Error fetching weather data: {e}")
-        return None
 
-def ask_gemini(question):
-    """Processes user question and generates a response."""
-    try:
-        if any(word in question.lower() for word in WEATHER_KEYWORDS):
-            weather_info = get_weather_data(CITY_NAME, OPENWEATHER_API_KEY)
-            if weather_info:
-                temp = weather_info['temperature_celsius']
-                condition = weather_info['condition']
+    def transcribe_simple(self, audio_data):
+        """Simple HTTP-based transcription for maximum speed"""
+        start_time = time.time()
+        
+        try:
+            url = "https://api.deepgram.com/v1/listen"
+            headers = {
+                "Authorization": f"Token {FastConfig.DEEPGRAM_API_KEY}",
+                "Content-Type": "audio/wav"
+            }
+            
+            params = {
+                "model": "nova-2-general",
+                "punctuate": "true",
+                "smart_format": "true"
+            }
+            
+            response = requests.post(
+                url,
+                headers=headers,
+                params=params,
+                data=audio_data,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
                 
-                # Gemini generates a conversational response based on real data
-                prompt = f"Given the weather data: temperature is {temp:.1f}°C and condition is {condition}, generate a short, one-sentence spoken response about the weather."
-                response_text = gemini_model.generate_content(prompt).text
+                # Check if any speech was detected
+                if not result.get('results') or not result['results'].get('channels'):
+                    logger.error("❌ No speech detected in the audio")
+                    return ""
+                    
+                transcript = result['results']['channels'][0]['alternatives'][0].get('transcript', '')
                 
-                display_weather(temp, condition)
-                display_weather_on_leds(float(temp))
-                return response_text
+                if not transcript.strip():
+                    logger.error("❌ No speech detected in the audio")
+                    return ""
+                
+                stt_time = time.time() - start_time
+                logger.info(f"📝 STT ({stt_time:.2f}s): {transcript}")
+                return transcript
             else:
-                return "Sorry, I couldn't get the current weather information."
-        
-        # General question handling
-        prompt = f"Please answer the following question in 1 or 2 short sentences:\n{question}"
-        response = gemini_model.generate_content(prompt).text
-        return response
-    
-    except Exception as e:
-        indicate_error()
-        print(f"Error while asking Gemini: {e}")
-        return "Sorry, I couldn't process that."
-
-async def transcribe_stream():
-    """Streams audio to Deepgram in real-time for low-latency transcription."""
-    deepgram_url = "wss://api.deepgram.com/v1/listen?punctuate=true&model=nova-2-general"
-    headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}"}
-
-    try:
-        indicate_listening()
-        async with websockets.connect(deepgram_url, extra_headers=headers) as ws:
-            transcription_complete = asyncio.Event()
-            transcribed_text = ""
-
-            async def receive_transcripts():
-                nonlocal transcribed_text
-                async for message in ws:
-                    response = json.loads(message)
-                    if response.get('is_final'):
-                        transcript = response['channel']['alternatives'][0]['transcript']
-                        transcribed_text = transcript
-                        print(f"You said: {transcript}")
-                        transcription_complete.set()
-                        break
-            
-            # Start the listener task
-            listener_task = asyncio.create_task(receive_transcripts())
-            
-            with sd.InputStream(samplerate=FS, channels=CHANNELS, dtype=np.int16, blocksize=BLOCK_SIZE) as mic_stream:
-                print("Listening for a complete sentence...")
-                while not transcription_complete.is_set():
-                    data, overflowed = mic_stream.read(mic_stream.read.blocksize, False)
-                    await ws.send(data.tobytes())
+                error_msg = response.text if response.text else "No error details provided"
+                logger.error(f"Deepgram error {response.status_code}: {error_msg}")
+                return ""
                 
-                await ws.close()
-                return transcribed_text
+        except Exception as e:
+            logger.error(f"Transcription error: {e}")
+            return ""
+
+    def get_cached_weather(self):
+        """Get weather with caching for speed"""
+        current_time = time.time()
+        
+        if (self.cached_weather is None or 
+            current_time - self.last_weather_update > self.weather_cache_duration):
+            
+            try:
+                url = f"http://api.openweathermap.org/data/2.5/weather?q={FastConfig.CITY_NAME}&appid={FastConfig.OPENWEATHER_API_KEY}&units=metric"
+                response = requests.get(url, timeout=3)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    self.cached_weather = {
+                        "temp": data["main"]["temp"],
+                        "condition": data["weather"][0]["description"],
+                        "city": data["name"]
+                    }
+                    self.last_weather_update = current_time
+                    logger.info("🌤️ Weather cached")
+                    
+            except Exception as e:
+                logger.error(f"Weather error: {e}")
+                
+        return self.cached_weather
+
+    def process_fast(self, question):
+        """Lightning-fast question processing"""
+        start_time = time.time()
+        question_lower = question.lower()
+        
+        try:
+            # Exit commands
+            if any(word in question_lower for word in ["exit", "quit", "stop", "bye"]):
+                return "EXIT"
+            
+            # Time queries
+            elif any(word in question_lower for word in FastConfig.TIME_KEYWORDS):
+                now = datetime.now()
+                response = f"It's {now.strftime('%I:%M %p')} on {now.strftime('%A, %B %d')}"
+            
+            # Weather queries
+            elif any(word in question_lower for word in FastConfig.WEATHER_KEYWORDS):
+                weather = self.get_cached_weather()
+                if weather:
+                    response = f"It's {weather['temp']:.0f} degrees with {weather['condition']} in {weather['city']}"
+                else:
+                    response = "Weather information unavailable"
+            
+            # General questions
+            else:
+                prompt = f"Answer in exactly one short sentence (maximum 15 words): {question}"
+                response = gemini_model.generate_content(
+                    prompt,
+                    generation_config={
+                        'max_output_tokens': 30,
+                        'temperature': 0.1
+                    }
+                ).text.strip()
+            
+            process_time = time.time() - start_time
+            logger.info(f"🧠 Processing ({process_time:.2f}s): {response}")
+            return response
+            
+        except Exception as e:
+            logger.error(f"Processing error: {e}")
+            return "Sorry, I had an error"
+
+    def speak_fast(self, text):
+        """Ultra-fast TTS with fallback to gTTS"""
+        start_time = time.time()
+        try:
+            # First try ElevenLabs
+            if self._try_elevenlabs_tts(text):
+                return
+                
+            # If ElevenLabs fails, try gTTS
+            if self._try_gtts(text):
+                return
+                
+            # If both TTS methods fail, fall back to text
+            logger.warning("All TTS methods failed, falling back to text")
+            print(f"🔊 Assistant (text only): {text}")
+            
+        except Exception as e:
+            logger.error(f"TTS error: {e}")
+            print(f"🔊 Assistant (error): {text}")
+        finally:
+            tts_time = time.time() - start_time
+            logger.info(f"🔊 TTS ({tts_time:.2f}s): {text}")
+            
+    def _try_elevenlabs_tts(self, text):
+        """Try to use ElevenLabs TTS, return True if successful"""
+        try:
+            url = f"https://api.elevenlabs.io/v1/text-to-speech/{FastConfig.ELEVENLABS_VOICE_ID}"
+            headers = {
+                "Accept": "audio/mpeg",
+                "Content-Type": "application/json",
+                "xi-api-key": FastConfig.ELEVENLABS_API_KEY
+            }
+            
+            data = {
+                "text": text,
+                "model_id": FastConfig.ELEVENLABS_FAST_MODEL,
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.5
+                }
+            }
+            
+            response = requests.post(url, json=data, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                # Play the audio
+                audio_data = BytesIO(response.content)
+                pygame.mixer.init()
+                pygame.mixer.music.load(audio_data)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    pygame.time.Clock().tick(10)
+                return True
+            else:
+                logger.warning(f"ElevenLabs TTS failed: {response.status_code} - {response.text}")
+                return False
+                
+        except Exception as e:
+            logger.warning(f"ElevenLabs TTS error: {e}")
+            return False
+            
+    def _try_gtts(self, text):
+        """Try to use gTTS, return True if successful"""
+        try:
+            logger.info("🔊 Trying gTTS fallback...")
+            # Create gTTS object
+            tts = gTTS(text=text, lang='en')
+            
+            # Save to bytes buffer
+            audio_buffer = BytesIO()
+            tts.write_to_fp(audio_buffer)
+            audio_buffer.seek(0)
+            
+            # Initialize pygame mixer if not already initialized
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+            
+            # Play the audio
+            pygame.mixer.music.load(audio_buffer)
+            pygame.mixer.music.play()
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
+            return True
+            
+        except Exception as e:
+            logger.error(f"gTTS error: {e}")
+            return False
+
+    def run_continuous(self):
+        """Run continuously without wake words"""
+        logger.info("🎯 Continuous mode - Press ENTER to start recording, 'q' to quit")
+        
+        # Pre-cache weather
+        self.get_cached_weather()
+        
+        while True:
+            try:
+                # Wait for user input
+                user_input = input("\nPress ENTER to start recording (or 'q' to quit): ").strip().lower()
+                
+                if user_input in ['q', 'quit', 'exit']:
+                    logger.info("👋 Goodbye!")
+                    break
+                
+                # Record and process
+                total_start = time.time()
+                
+                # Step 1: Record
+                audio_data = self.record_audio_simple()
+                if not audio_data:
+                    continue
+                
+                # Step 2: Transcribe
+                text = self.transcribe_simple(audio_data)
+                if not text or not text.strip():
+                    print("❌ No speech detected")
+                    continue
+                
+                # Step 3: Process
+                response = self.process_fast(text)
+                if response == "EXIT":
+                    logger.info("👋 Goodbye!")
+                    break
+                
+                # Step 4: Speak
+                self.speak_fast(response)
+                
+                # Performance summary
+                total_time = time.time() - total_start
+                logger.info(f"⚡ Total response time: {total_time:.2f}s")
+                
+            except KeyboardInterrupt:
+                logger.info("👋 Interrupted by user")
+                break
+            except Exception as e:
+                logger.error(f"Main loop error: {e}")
+                time.sleep(0.5)
+
+def main():
+    """Main entry point"""
+    assistant = UltraFastAssistant()
     
-    except Exception as e:
-        indicate_error()
-        print(f"Error during transcription streaming: {e}")
-        return ""
+    print("""
+🚀 ULTRA-FAST VOICE ASSISTANT 
+===============================
+- No wake words needed
+- Press ENTER to start recording
+- Speak for 5 seconds when prompted
+- Type 'q' to quit
+    """)
+    
+    assistant.run_continuous()
 
-# ---------------- MAIN LOOP ----------------
-async def main():
-    print("Voice Assistant Initialized. Press Ctrl+C to stop.")
-    clear_display()
-    lcd.write_string("Assistant Ready")
-    time.sleep(2)
-    clear_display()
-    all_leds_off()
-
-    while True:
-        text = await transcribe_stream()
-        all_leds_off()
-        
-        if not text.strip():
-            print("No speech detected.")
-            speak("I didn't hear you. Please try again.")
-            continue
-        
-        if "exit" in text.lower() or "quit" in text.lower():
-            speak("Goodbye!")
-            clear_display()
-            lcd.write_string("Goodbye!")
-            time.sleep(2)
-            break
-        
-        indicate_processing()
-        answer = ask_gemini(text)
-        all_leds_off()
-        speak(answer)
-        all_leds_off()
-        clear_display()
-        
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nAssistant stopped.")
-    finally:
-        all_leds_off()
-        clear_display()
-        GPIO.cleanup()
+    main()
