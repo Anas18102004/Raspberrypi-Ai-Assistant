@@ -85,10 +85,10 @@ def clear_display():
 
 def display_weather_on_leds(temp):
     all_leds_off()
-
+    
     # Define temperature ranges for each LED
     temp_ranges = [10, 15, 20, 25, 30, 35, 40, 45]
-
+    
     for i, threshold in enumerate(temp_ranges):
         if temp >= threshold:
             turn_on(ALL_LEDS[i])
@@ -141,14 +141,10 @@ async def transcribe_audio(file_path):
 
 def ask_gemini(question):
     try:
-        # Check for weather-related keywords
         if any(word in question.lower() for word in WEATHER_KEYWORDS):
-            # Tell Gemini to provide a JSON response with weather details
             prompt = f"Using real-time data, what is the current weather in {CITY_NAME}? Respond in a single JSON object with 'temperature_celsius', 'condition', and 'spoken_response' keys. The 'spoken_response' should be a short sentence."
-
             response = gemini_model.generate_content(prompt).text
 
-            # Parse the JSON response
             try:
                 weather_data = json.loads(response)
                 temp = weather_data.get('temperature_celsius')
@@ -156,21 +152,16 @@ def ask_gemini(question):
                 spoken_response = weather_data.get('spoken_response')
 
                 if temp is not None and condition:
-                    # Display data on LCD and LEDs
                     display_weather(temp, condition)
                     display_weather_on_leds(float(temp))
-
-                    # Return the spoken response for text-to-speech
                     return spoken_response
                 else:
                     return "Sorry, I couldn't get the specific weather data from Gemini."
 
             except json.JSONDecodeError:
-                # If Gemini doesn't return valid JSON, just speak its response as is
                 print("Gemini response was not valid JSON.")
                 return response
 
-        # For non-weather questions, use the original prompt
         prompt = f"Please answer the following question in 1 or 2 short sentences:\n{question}"
         response = gemini_model.generate_content(prompt).text
         return response
@@ -193,9 +184,13 @@ async def main():
         text = await transcribe_audio(audio_file)
         os.remove(audio_file)
 
+        # Fallback to text input if voice transcription is empty
         if not text.strip():
-            speak("Didn't catch that. Please try again.")
-            continue
+            print("No speech detected. Please type your question:")
+            text = input("You: ")
+            if not text.strip():
+                speak("No question provided. Please try again.")
+                continue
 
         if "exit" in text.lower() or "quit" in text.lower():
             speak("Goodbye!")
