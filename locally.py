@@ -513,11 +513,72 @@ Krishna:"""
             self.text_queue.put(None)
 
 # ---------------- MAIN EXECUTION ---------------- #
+def check_dependencies():
+    """Check if required dependencies are available"""
+    missing_deps = []
+    
+    try:
+        import sounddevice
+    except ImportError:
+        missing_deps.append("sounddevice")
+    
+    try:
+        import whisper
+    except ImportError:
+        missing_deps.append("openai-whisper")
+    
+    try:
+        import pyttsx3
+    except ImportError:
+        missing_deps.append("pyttsx3")
+    
+    try:
+        import numpy
+    except ImportError:
+        missing_deps.append("numpy")
+    
+    if missing_deps:
+        print("❌ Missing required dependencies:")
+        for dep in missing_deps:
+            print(f"   - {dep}")
+        print("\nInstall missing dependencies with:")
+        print(f"   pip install {' '.join(missing_deps)}")
+        return False
+    
+    return True
+
+def install_system_tts():
+    """Provide instructions for installing system TTS on Raspberry Pi"""
+    print("\n📢 TTS Setup for Raspberry Pi:")
+    print("If TTS is not working, try installing system TTS engines:")
+    print("   sudo apt update")
+    print("   sudo apt install espeak espeak-data")
+    print("   # OR")
+    print("   sudo apt install festival festvox-kallpc16k")
+    print("\nThen restart the program.")
+
 if __name__ == "__main__":
     try:
+        if not check_dependencies():
+            input("Press Enter to exit...")
+            exit(1)
+            
         assistant = KrishnaVoiceAssistant()
         assistant.run()
     except Exception as e:
         logger.error(f"Failed to start Krishna: {e}")
         print(f"❌ Startup error: {e}")
+        
+        # Provide helpful suggestions based on the error
+        if "voice" in str(e).lower() or "tts" in str(e).lower():
+            install_system_tts()
+        elif "model" in str(e).lower():
+            print("\n📁 Model file error:")
+            print("Make sure the TinyLlama model path is correct:")
+            print("   Check the TINYLLAMA_MODEL_PATH in the Config class")
+        elif "audio" in str(e).lower():
+            print("\n🎤 Audio error:")
+            print("Make sure your microphone is connected and working")
+            print("   You can test with: arecord -l")
+        
         input("Press Enter to exit...")
