@@ -307,7 +307,7 @@ class AerospaceVoiceAssistant:
     def setup_logging(self):
         log_format = '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
         logging.getLogger().handlers.clear()
-        file_handler = logging.FileHandler('krishna_assistant.log', encoding='utf-8')
+        file_handler = logging.FileHandler('krishna_voice_assistant.log', encoding='utf-8')
         file_handler.setFormatter(logging.Formatter(log_format))
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setFormatter(logging.Formatter(log_format))
