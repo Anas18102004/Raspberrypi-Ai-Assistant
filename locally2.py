@@ -1,17 +1,3 @@
-#!/usr/bin/env python3
-"""
-Aerospace-Grade Voice Assistant - Krishna
-Developed with NASA/ISRO mission-critical reliability standards
-
-Features:
-- Dual Mode Operation: Assistant Mode (Autonomous) & Test Mode (Manual)
-- Sleep/Wake Cycle: "shutdown" puts to sleep, "hello krishna" wakes up
-- Multi-layer TTS redundancy with automatic failover
-- Robust audio processing with VAD (Voice Activity Detection)
-- Context-aware response generation with safety limits
-- Real-time system health monitoring
-- Graceful error recovery and system diagnostics
-"""
 
 import os
 import sys
