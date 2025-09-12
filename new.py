@@ -988,6 +988,7 @@ class RaspberryPiVoiceAssistant:
                         
                         # Manual recording in test mode
                         print("\n" + "="*50)
+                        print("🎙️ Recording will start now. Please speak clearly.")
                         audio_data = self.record_audio_advanced()
                         
                         if audio_data is not None:
