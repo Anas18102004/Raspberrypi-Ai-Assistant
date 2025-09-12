@@ -11,13 +11,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
 import traceback
+import requests  # New dependency for making API calls
 
 # Core audio and ML libraries
 import sounddevice as sd
 import numpy as np
 import wave
 import whisper
-from llama_cpp import Llama  # Changed from ctransformers
 
 # TTS Libraries (multiple redundancy layers)
 try:
@@ -44,8 +44,9 @@ except ImportError:
 class Config:
     # Model Configuration
     WHISPER_MODEL = "base"
-    # Llama.cpp models use the GGUF format and are often found on Hugging Face
-    LLAMA_GGUF_PATH = "./tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf" 
+    # Ollama uses a model name, not a local file path
+    OLLAMA_MODEL_NAME = "tinyllama"
+    OLLAMA_API_URL = "http://localhost:11434/api/generate"
     
     # Audio Configuration
     SAMPLE_RATE = 16000
@@ -60,7 +61,6 @@ class Config:
     MAX_TOKENS = 25
     TEMPERATURE = 0.1
     TOP_P = 0.8
-    CONTEXT_LENGTH = 256
     REPETITION_PENALTY = 1.3
     
     # System Configuration
@@ -353,18 +353,23 @@ class AerospaceVoiceAssistant:
             self.logger.critical(f"❌ Failed to load Whisper model: {e}")
             raise
         
+        # New: Verify Ollama is running and the model is available
         try:
-            self.llm = Llama(
-                model_path=Config.LLAMA_GGUF_PATH,
-                n_ctx=Config.CONTEXT_LENGTH,
-                n_gpu_layers=0,  # Set to 0 to run on CPU, which is required for Raspberry Pi
-                verbose=False
+            res = requests.post(
+                f"http://localhost:11434/api/show",
+                json={"name": Config.OLLAMA_MODEL_NAME},
+                timeout=5
             )
-            self.logger.info("✅ Llama.cpp model loaded successfully")
+            if res.status_code != 200:
+                raise RuntimeError(f"Ollama server or model '{Config.OLLAMA_MODEL_NAME}' not found. Status: {res.status_code}")
+            self.logger.info("✅ Ollama connection and model verified.")
+        except requests.exceptions.ConnectionError:
+            self.logger.critical(f"❌ Ollama server not running at {Config.OLLAMA_API_URL}. Please start it.")
+            raise RuntimeError("Ollama server not running.")
         except Exception as e:
-            self.logger.critical(f"❌ Failed to load Llama.cpp model: {e}")
+            self.logger.critical(f"❌ Failed to initialize Ollama: {e}")
             raise
-    
+
     def start_background_threads(self):
         self.audio_thread = threading.Thread(target=self.process_audio_queue, daemon=True)
         self.audio_thread.start()
@@ -604,37 +609,43 @@ class AerospaceVoiceAssistant:
                 awake_status = "SLEEPING" if self.is_sleeping else ("AWAKE" if self.is_assistant_awake else "STANDBY")
                 return f"Current mode: {self.current_mode}. Assistant status: {awake_status}."
             
-            prompt = f"### System: You are an autonomous aerospace robot assistant named Krishna. Provide a concise, professional, and helpful response. Be brief and to the point.\n\n### User: {text}\n\n### Assistant: "
+            prompt_data = {
+                "model": Config.OLLAMA_MODEL_NAME,
+                "prompt": text,
+                "stream": False,
+                "options": {
+                    "temperature": Config.TEMPERATURE,
+                    "top_p": Config.TOP_P,
+                    "num_predict": Config.MAX_TOKENS,
+                    "repeat_penalty": Config.REPETITION_PENALTY,
+                },
+                "system": f"You are an autonomous aerospace robot assistant named Krishna. Provide a concise, professional, and helpful response. Be brief and to the point. Respond in a single sentence."
+            }
+            
+            # Make the API call to the Ollama service
+            response = requests.post(Config.OLLAMA_API_URL, json=prompt_data)
+            response.raise_for_status()  # Raise an exception for bad status codes
+            
+            llm_response = response.json()
+            response_text = llm_response['response'].strip()
 
-            output = self.llm.create_completion(
-                prompt=prompt,
-                max_tokens=Config.MAX_TOKENS,
-                temperature=Config.TEMPERATURE,
-                top_p=Config.TOP_P,
-                repeat_penalty=Config.REPETITION_PENALTY,
-                stop=["### User:", "###", "\n"]
-            )
-            response = output['choices'][0]['text'].strip()
-
-            if not response:
+            if not response_text:
                 return "I'm experiencing processing difficulties. Please retry."
             
             # Post-process the response for brevity
-            words = response.split()
+            words = response_text.split()
             if len(words) > 10:  # Trim to a reasonable length
-                response = ' '.join(words[:10]) + '...'
+                response_text = ' '.join(words[:10]) + '...'
             
-            if response and response[-1] not in '.!?':
-                response += '.'
+            if response_text and response_text[-1] not in '.!?':
+                response_text += '.'
             
-            return response
+            return response_text
         
         except Exception as e:
             self.logger.error(f"Response generation failed: {e}")
             self.health_monitor.log_error("llm")
             return "I'm experiencing processing difficulties. Please retry."
-        
-        return "I don't understand. Could you rephrase that?"
     
     def process_audio_queue(self):
         while self.is_running:
