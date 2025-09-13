@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+"""
+Krishna Voice Assistant for Raspberry Pi - Optimized Version
+Advanced AI Assistant with Real-time Processing and Web Search Integration
+
+Features:
+- Real-time voice processing optimized for ARM architecture
+- Intelligent context-aware responses
+- Google Search integration for recent/unknown information
+- Multi-modal interaction (voice + text + web)
+- gTTS-based text-to-speech system
+- Raspberry Pi hardware optimization
+- Comprehensive conversation memory and context
+"""
+
 import os
 import sys
 import time
@@ -8,522 +23,977 @@ import json
 import subprocess
 import platform
 import requests
-import tempfile
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 import traceback
+import concurrent.futures
+from dataclasses import dataclass
+from urllib.parse import quote_plus
+import tempfile
+import io
 
 # Core audio and ML libraries
 import sounddevice as sd
 import numpy as np
 import wave
 import whisper
+from ctransformers import AutoModelForCausalLM
 
-# TTS Libraries (multiple redundancy layers)
+# gTTS for text-to-speech
+from gtts import gTTS
+import pygame
+
+# Web search and parsing
 try:
-    from gtts import gTTS
-    import pygame
-    GTTS_AVAILABLE = True
-    pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
-    pygame.init()  # Initialize pygame
-    pygame.mixer.music.set_volume(0.8)
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
 except ImportError:
-    GTTS_AVAILABLE = False
+    BS4_AVAILABLE = False
+    print("Warning: BeautifulSoup4 not available, web search will be limited")
 
+# Advanced VAD
 try:
-    import win32com.client
-    SAPI_AVAILABLE = True
+    import librosa
+    LIBROSA_AVAILABLE = True
 except ImportError:
-    SAPI_AVAILABLE = False
+    LIBROSA_AVAILABLE = False
 
-# Configuration Constants
+@dataclass
+class ConversationContext:
+    """Track conversation context for intelligent responses"""
+    recent_topics: List[str]
+    user_preferences: Dict[str, Any]
+    conversation_history: List[Dict[str, str]]
+    last_search_query: Optional[str]
+    last_search_time: Optional[datetime]
+    current_session_start: datetime
+
 class Config:
-    # Model Configuration
-    WHISPER_MODEL = "base"
+    """Configuration optimized for Raspberry Pi"""
     
-    # Ollama Configuration
-    OLLAMA_MODEL = "tinyllama"  # Make sure this matches your installed model
-    OLLAMA_URL = "http://localhost:11434/api/generate"
-    OLLAMA_TIMEOUT = 30
+    # Model path - adjust this for your Raspberry Pi setup
+    TINYLLAMA_PATH = "/home/pi/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
     
-    # Audio Configuration
+    # Audio Configuration - optimized for Pi
     SAMPLE_RATE = 16000
     CHANNELS = 1
     DTYPE = np.float32
-    RECORD_DURATION = 6
-    MIN_RECORDING_LENGTH = 0.5
-    SILENCE_THRESHOLD = 0.01
-    MAX_SILENCE_DURATION = 2.0
     
-    # LLM Configuration
-    MAX_TOKENS = 25
-    TEMPERATURE = 0.1
+    # Real-time streaming parameters - reduced for Pi performance
+    CHUNK_DURATION = 0.8  # Increased for better Pi performance
+    CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION)
+    OVERLAP_SIZE = int(CHUNK_SIZE * 0.25)
+    
+    # Advanced VAD parameters - tuned for Pi
+    VAD_ENERGY_THRESHOLD = 0.008  # Slightly higher for Pi microphones
+    VAD_SPECTRAL_THRESHOLD = 0.25
+    VAD_MIN_SPEECH_DURATION = 0.5
+    VAD_MAX_SILENCE_DURATION = 2.0
+    VAD_HANGOVER_FRAMES = 3
+    
+    # Model Configuration - optimized for Pi
+    WHISPER_MODEL = "tiny"  # Using tiny model for Pi performance
+    MAX_TOKENS = 30  # Reduced for Pi
+    TEMPERATURE = 0.3
     TOP_P = 0.8
-    REPETITION_PENALTY = 1.3
+    CONTEXT_LENGTH = 256  # Reduced for Pi memory
+    REPETITION_PENALTY = 1.2
     
-    # System Configuration
-    MAX_RETRY_ATTEMPTS = 3
-    HEALTH_CHECK_INTERVAL = 30
-    LOG_LEVEL = logging.INFO
+    # AI Assistant Configuration
+    MAX_CONVERSATION_HISTORY = 15  # Reduced for Pi memory
+    CONTEXT_WINDOW_MINUTES = 20
     
-    # Assistant Mode Configuration
-    ASSISTANT_WAKE_WORDS = ["hello krishna", "hey krishna", "wake up krishna", "activate krishna", "krishna wake up", "wake up krishna","wake up ","hello"]
-    ASSISTANT_SLEEP_WORDS = ["sleep krishna", "shutdown", "go to sleep", "hibernate", "power down","ok bye","ok thank you"]
-    ASSISTANT_CONTINUOUS_LISTENING_INTERVAL = 3.0  # Seconds between listening cycles
+    # gTTS Configuration
+    TTS_LANGUAGE = 'en'
+    TTS_SLOW = False
+    TTS_CACHE_DIR = '/tmp/krishna_tts_cache'
     
-    # Sleep mode configuration
-    SLEEP_MODE_LISTENING_INTERVAL = 5.0  # Longer interval when sleeping
-    WAKE_WORD_CONFIDENCE_THRESHOLD = 0.3
+    # Web Search Configuration
+    SEARCH_TRIGGERS = [
+        "what's the latest", "recent news", "current", "today", "this week",
+        "search for", "look up", "find information", "google", "search",
+        "what happened", "breaking news", "update on", "recent developments"
+    ]
     
-    # Common Words
-    EMERGENCY_WORDS = ["emergency", "help", "urgent", "critical"]
-    MODE_SWITCH_WORDS = ["switch mode", "change mode", "test mode", "assistant mode"]
+    SEARCH_DOMAINS = [
+        "news", "weather", "sports", "technology", "science", "politics",
+        "stock market", "cryptocurrency", "current events"
+    ]
+    
+    # Performance thresholds - adjusted for Pi
+    MAX_PROCESSING_TIME = 5.0  # Increased for Pi
+    PARALLEL_WORKERS = 2  # Reduced for Pi
+    TARGET_RESPONSE_TIME = 2.0  # More realistic for Pi
+    MAX_ACCEPTABLE_LATENCY = 4.0
+    
+    # Wake/sleep words
+    ASSISTANT_WAKE_WORDS = ["hello krishna", "hey krishna", "krishna wake up", "wake up krishna"]
+    ASSISTANT_SLEEP_WORDS = ["shutdown", "go to sleep", "sleep now", "power down"]
+    
+    # Emergency and priority words
+    EMERGENCY_WORDS = ["emergency", "urgent", "help", "critical", "mayday"]
+    PRIORITY_WORDS = ["important", "priority", "asap", "immediately"]
 
-class SystemHealthMonitor:
-    """Mission-critical system health monitoring"""
+class GTTSHandler:
+    """Optimized gTTS handler for Raspberry Pi"""
     
     def __init__(self):
-        self.start_time = time.time()
-        self.last_health_check = time.time()
-        self.error_count = 0
-        self.successful_interactions = 0
-        self.tts_failures = 0
-        self.transcription_failures = 0
-        self.llm_failures = 0
-        self.sleep_wake_cycles = 0
-        self.ollama_connection_failures = 0
+        self.cache_dir = Config.TTS_CACHE_DIR
+        self.setup_cache()
+        self.setup_pygame()
+        self.cache = {}  # In-memory cache for recent TTS
         
-    def log_error(self, error_type: str):
-        self.error_count += 1
-        if error_type == "tts":
-            self.tts_failures += 1
-        elif error_type == "transcription":
-            self.transcription_failures += 1
-        elif error_type == "llm":
-            self.llm_failures += 1
-        elif error_type == "ollama":
-            self.ollama_connection_failures += 1
+    def setup_cache(self):
+        """Setup TTS cache directory"""
+        os.makedirs(self.cache_dir, exist_ok=True)
     
-    def log_success(self):
-        self.successful_interactions += 1
+    def setup_pygame(self):
+        """Initialize pygame mixer for audio playback"""
+        try:
+            pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
+            self.pygame_available = True
+            print("✓ pygame audio mixer initialized")
+        except Exception as e:
+            print(f"pygame mixer initialization failed: {e}")
+            self.pygame_available = False
     
-    def log_sleep_wake_cycle(self):
-        self.sleep_wake_cycles += 1
+    def get_cache_key(self, text: str) -> str:
+        """Generate cache key for text"""
+        import hashlib
+        return hashlib.md5(text.encode()).hexdigest()
     
-    def get_status(self) -> Dict:
-        uptime = time.time() - self.start_time
+    def speak(self, text: str):
+        """Speak text using gTTS with caching"""
+        if not text.strip():
+            return
+            
+        try:
+            cache_key = self.get_cache_key(text)
+            cache_file = os.path.join(self.cache_dir, f"{cache_key}.mp3")
+            
+            # Check if cached file exists
+            if not os.path.exists(cache_file):
+                # Generate new TTS
+                tts = gTTS(
+                    text=text, 
+                    lang=Config.TTS_LANGUAGE, 
+                    slow=Config.TTS_SLOW
+                )
+                tts.save(cache_file)
+            
+            # Play audio
+            if self.pygame_available:
+                self.play_with_pygame(cache_file)
+            else:
+                self.play_with_system(cache_file)
+                
+        except Exception as e:
+            print(f"TTS error: {e}")
+            print(f"[Krishna]: {text}")
+    
+    def play_with_pygame(self, audio_file: str):
+        """Play audio using pygame"""
+        try:
+            pygame.mixer.music.load(audio_file)
+            pygame.mixer.music.play()
+            
+            # Wait for playback to complete
+            while pygame.mixer.music.get_busy():
+                pygame.time.Clock().tick(10)
+                
+        except Exception as e:
+            print(f"pygame playback error: {e}")
+            self.play_with_system(audio_file)
+    
+    def play_with_system(self, audio_file: str):
+        """Fallback to system audio player"""
+        try:
+            # Try different audio players available on Pi
+            players = ['mpg123', 'omxplayer', 'aplay', 'paplay']
+            
+            for player in players:
+                if subprocess.run(['which', player], 
+                                capture_output=True).returncode == 0:
+                    if player == 'omxplayer':
+                        subprocess.run([player, '-o', 'local', audio_file], 
+                                     capture_output=True)
+                    else:
+                        subprocess.run([player, audio_file], 
+                                     capture_output=True)
+                    return
+                    
+            print("No audio player found, TTS output to console only")
+            
+        except Exception as e:
+            print(f"System audio playback error: {e}")
+    
+    def cleanup_old_cache(self, max_age_hours: int = 24):
+        """Clean up old cache files"""
+        try:
+            cutoff_time = time.time() - (max_age_hours * 3600)
+            for filename in os.listdir(self.cache_dir):
+                filepath = os.path.join(self.cache_dir, filename)
+                if os.path.getctime(filepath) < cutoff_time:
+                    os.remove(filepath)
+        except Exception as e:
+            print(f"Cache cleanup error: {e}")
+
+class WebSearchEngine:
+    """Intelligent web search engine for knowledge augmentation"""
+    
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (X11; Linux armv7l) AppleWebKit/537.36'
+        })
+        self.last_search_time = {}  # Rate limiting
+        
+    def should_search(self, query: str, context: ConversationContext) -> bool:
+        """Determine if query requires web search"""
+        query_lower = query.lower()
+        
+        # Check for explicit search triggers
+        for trigger in Config.SEARCH_TRIGGERS:
+            if trigger in query_lower:
+                return True
+        
+        # Check for time-sensitive queries
+        time_indicators = ["today", "now", "current", "latest", "recent", "this week", "this month"]
+        if any(indicator in query_lower for indicator in time_indicators):
+            return True
+        
+        # Check for domain-specific queries that need current info
+        for domain in Config.SEARCH_DOMAINS:
+            if domain in query_lower:
+                return True
+        
+        # Check for factual questions that might need verification
+        question_starters = ["what is", "who is", "when did", "where is", "how many"]
+        if any(query_lower.startswith(starter) for starter in question_starters):
+            return True
+        
+        return False
+    
+    def search_google(self, query: str, num_results: int = 2) -> List[Dict[str, str]]:
+        """Search Google and return structured results"""
+        try:
+            # Rate limiting
+            now = time.time()
+            if query in self.last_search_time:
+                if now - self.last_search_time[query] < 15:  # 15 second cooldown for Pi
+                    return []
+            
+            self.last_search_time[query] = now
+            
+            # Use DuckDuckGo as more reliable alternative
+            search_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
+            
+            response = self.session.get(search_url, timeout=8)  # Increased timeout for Pi
+            response.raise_for_status()
+            
+            if not BS4_AVAILABLE:
+                # Simple fallback without parsing
+                return [{
+                    "title": "Search Results Available",
+                    "snippet": f"Found information about: {query}",
+                    "url": search_url
+                }]
+            
+            soup = BeautifulSoup(response.text, 'html.parser')
+            results = []
+            
+            # Parse DuckDuckGo results
+            for result in soup.find_all('div', class_='result')[:num_results]:
+                try:
+                    title_elem = result.find('a', class_='result__a')
+                    snippet_elem = result.find('a', class_='result__snippet')
+                    
+                    if title_elem and snippet_elem:
+                        results.append({
+                            "title": title_elem.get_text().strip(),
+                            "snippet": snippet_elem.get_text().strip(),
+                            "url": title_elem.get('href', '')
+                        })
+                except Exception:
+                    continue
+            
+            return results
+            
+        except Exception as e:
+            logging.error(f"Search error: {e}")
+            return []
+    
+    def get_current_time_info(self) -> str:
+        """Get comprehensive current time information"""
+        now = datetime.now()
+        return f"Current time: {now.strftime('%I:%M %p')}, Date: {now.strftime('%A, %B %d, %Y')}"
+
+class IntelligentResponseGenerator:
+    """Advanced response generation with context awareness"""
+    
+    def __init__(self, llm, search_engine: WebSearchEngine):
+        self.llm = llm
+        self.search_engine = search_engine
+        self.conversation_context = ConversationContext(
+            recent_topics=[],
+            user_preferences={},
+            conversation_history=[],
+            last_search_query=None,
+            last_search_time=None,
+            current_session_start=datetime.now()
+        )
+    
+    def update_context(self, user_input: str, assistant_response: str):
+        """Update conversation context"""
+        self.conversation_context.conversation_history.append({
+            "timestamp": datetime.now().isoformat(),
+            "user": user_input,
+            "assistant": assistant_response
+        })
+        
+        # Keep only recent history
+        if len(self.conversation_context.conversation_history) > Config.MAX_CONVERSATION_HISTORY:
+            self.conversation_context.conversation_history.pop(0)
+        
+        # Extract topics (simple keyword extraction)
+        words = user_input.lower().split()
+        topics = [word for word in words if len(word) > 4 and word.isalpha()]
+        self.conversation_context.recent_topics.extend(topics[-3:])  # Last 3 meaningful words
+        
+        # Keep recent topics list manageable
+        if len(self.conversation_context.recent_topics) > 15:  # Reduced for Pi
+            self.conversation_context.recent_topics = self.conversation_context.recent_topics[-15:]
+    
+    def generate_enhanced_response(self, user_input: str) -> str:
+        """Generate contextually aware response with web search integration"""
+        try:
+            # Check if we need to search
+            if self.search_engine.should_search(user_input, self.conversation_context):
+                return self.generate_search_enhanced_response(user_input)
+            else:
+                return self.generate_local_response(user_input)
+        
+        except Exception as e:
+            logging.error(f"Response generation error: {e}")
+            return "I'm experiencing some technical difficulties. Could you please try again?"
+    
+    def generate_search_enhanced_response(self, user_input: str) -> str:
+        """Generate response with web search integration"""
+        try:
+            # Perform search
+            search_results = self.search_engine.search_google(user_input)
+            
+            if search_results:
+                # Combine search results with local knowledge
+                search_context = ""
+                for i, result in enumerate(search_results[:1]):  # Use only 1 result for Pi
+                    search_context += f"Recent info: {result['title']} - {result['snippet'][:150]}... "
+                
+                # Create enhanced prompt - simplified for Pi
+                prompt = f"""Krishna assistant with current info.
+User: {user_input}
+Context: {search_context}
+Respond helpfully in under 20 words:
+Krishna:"""
+                
+                response = self.llm(prompt)
+                self.conversation_context.last_search_query = user_input
+                self.conversation_context.last_search_time = datetime.now()
+                
+            else:
+                # Fallback to local response if search fails
+                response = self.generate_local_response(user_input)
+                response += " (Could not access online information.)"
+            
+            return self.clean_response(response)
+            
+        except Exception as e:
+            logging.error(f"Search-enhanced response error: {e}")
+            return self.generate_local_response(user_input)
+    
+    def generate_local_response(self, user_input: str) -> str:
+        """Generate response using local LLM with conversation context"""
+        try:
+            context_summary = self.get_context_summary()
+            
+            # Create contextual prompt - simplified for Pi
+            prompt = f"""Krishna AI assistant.
+Context: {context_summary}
+User: {user_input}
+Respond naturally in under 20 words:
+Krishna:"""
+            
+            response = self.llm(prompt)
+            return self.clean_response(response)
+            
+        except Exception as e:
+            logging.error(f"Local response error: {e}")
+            return "I need a moment to process that. Could you repeat your question?"
+    
+    def get_context_summary(self) -> str:
+        """Get summary of recent conversation context"""
+        if not self.conversation_context.conversation_history:
+            return "New conversation"
+        
+        recent_exchanges = self.conversation_context.conversation_history[-2:]  # Reduced for Pi
+        summary_parts = []
+        
+        for exchange in recent_exchanges:
+            user_text = exchange['user'][:30] + "..." if len(exchange['user']) > 30 else exchange['user']
+            summary_parts.append(f"User: {user_text}")
+        
+        return " | ".join(summary_parts)
+    
+    def clean_response(self, response: str) -> str:
+        """Clean and validate the response"""
+        if isinstance(response, str):
+            response = response.strip()
+            
+            # Remove common prefixes
+            prefixes = ["Krishna:", "Assistant:", "AI:", "Response:", "Answer:"]
+            for prefix in prefixes:
+                if response.startswith(prefix):
+                    response = response[len(prefix):].strip()
+            
+            # Limit word count for Pi performance
+            words = response.split()[:20]  # Max 20 words for Pi
+            response = ' '.join(words)
+            
+            # Ensure proper ending
+            if response and response[-1] not in '.!?':
+                response += '.'
+            
+            # Validate minimum quality
+            if len(response.split()) < 2:
+                return "I need more context to help you."
+            
+            return response
+        
+        return "I'm having trouble with that request."
+
+class AdvancedVAD:
+    """Voice Activity Detection optimized for Raspberry Pi"""
+    
+    def __init__(self, sample_rate=Config.SAMPLE_RATE):
+        self.sample_rate = sample_rate
+        self.frame_length = int(0.025 * sample_rate)
+        self.hop_length = int(0.01 * sample_rate)
+        self.n_mfcc = 13
+        self.n_fft = 512
+        self.speech_frames = 0
+        self.silence_frames = 0
+        self.is_speech_active = False
+        
+    def analyze_chunk(self, audio_chunk: np.ndarray) -> Dict:
+        """Analyze audio chunk for speech activity - Pi optimized"""
+        if len(audio_chunk) == 0:
+            return {"is_speech": False, "confidence": 0.0, "energy": 0.0}
+        
+        energy = np.mean(audio_chunk ** 2)
+        
+        # Simplified VAD for Pi performance
+        if LIBROSA_AVAILABLE:
+            try:
+                zcr = np.mean(librosa.feature.zero_crossing_rate(audio_chunk, 
+                                                               frame_length=self.frame_length,
+                                                               hop_length=self.hop_length))
+                confidence = energy * 2.0 + (1.0 if zcr > 0.01 and zcr < 0.3 else 0.0)
+            except Exception:
+                zcr = np.mean(np.diff(np.signbit(audio_chunk)))
+                confidence = energy * 3.0
+        else:
+            zcr = np.mean(np.diff(np.signbit(audio_chunk)))
+            confidence = energy * 3.0 if energy > Config.VAD_ENERGY_THRESHOLD else 0.0
+        
+        is_speech = confidence > Config.VAD_SPECTRAL_THRESHOLD
+        
         return {
-            "uptime_seconds": uptime,
-            "uptime_formatted": str(timedelta(seconds=int(uptime))),
-            "total_errors": self.error_count,
-            "successful_interactions": self.successful_interactions,
-            "success_rate": self.successful_interactions / max(1, self.successful_interactions + self.error_count),
-            "tts_failures": self.tts_failures,
-            "transcription_failures": self.transcription_failures,
-            "llm_failures": self.llm_failures,
-            "ollama_failures": self.ollama_connection_failures,
-            "sleep_wake_cycles": self.sleep_wake_cycles,
-            "system_status": "OPERATIONAL" if self.error_count < 10 else "DEGRADED"
+            "is_speech": is_speech,
+            "confidence": min(confidence, 1.0),
+            "energy": energy,
+            "zcr": zcr
+        }
+    
+    def update_state(self, vad_result: Dict) -> bool:
+        """Update speech state with hangover logic"""
+        if vad_result["is_speech"]:
+            self.speech_frames += 1
+            self.silence_frames = 0
+            if not self.is_speech_active and self.speech_frames >= 2:  # Reduced for Pi
+                self.is_speech_active = True
+                return True
+        else:
+            self.silence_frames += 1
+            if self.is_speech_active:
+                if self.silence_frames >= Config.VAD_HANGOVER_FRAMES:
+                    self.is_speech_active = False
+                    self.speech_frames = 0
+                    return True
+        return False
+
+class RealTimeAudioProcessor:
+    """Real-time streaming audio processor optimized for Pi"""
+    
+    def __init__(self, callback, sample_rate=Config.SAMPLE_RATE):
+        self.callback = callback
+        self.sample_rate = sample_rate
+        self.chunk_size = Config.CHUNK_SIZE
+        self.vad = AdvancedVAD(sample_rate)
+        self.recording_buffer = []
+        self.is_recording = False
+        self.last_speech_time = 0
+        self.chunk_processing_times = []
+        
+    def audio_callback(self, indata, frames, time_info, status):
+        """Real-time audio callback - Pi optimized"""
+        try:
+            if status:
+                logging.warning(f"Audio callback status: {status}")
+            
+            audio_chunk = indata.flatten().copy()
+            energy = np.mean(audio_chunk ** 2)
+            
+            # Skip very quiet audio to save Pi resources
+            if energy < Config.VAD_ENERGY_THRESHOLD * 0.05:
+                return
+            
+            try:
+                self.process_chunk_async(audio_chunk)
+            except Exception as e:
+                logging.error(f"Chunk processing error: {e}")
+        except Exception as e:
+            logging.error(f"Audio callback error: {e}")
+    
+    def process_chunk_async(self, audio_chunk: np.ndarray):
+        """Process audio chunk asynchronously - Pi optimized"""
+        start_time = time.time()
+        vad_result = self.vad.analyze_chunk(audio_chunk)
+        state_changed = self.vad.update_state(vad_result)
+        current_time = time.time()
+        
+        if vad_result["is_speech"]:
+            self.last_speech_time = current_time
+            if not self.is_recording:
+                self.is_recording = True
+                self.recording_buffer = [audio_chunk]
+                print(f"\rListening... (conf: {vad_result['confidence']:.2f})", end="", flush=True)
+            else:
+                self.recording_buffer.append(audio_chunk)
+                
+                # Limit buffer size for Pi memory
+                if len(self.recording_buffer) > 100:  # About 10 seconds at current settings
+                    self.finalize_recording()
+                    
+        elif self.is_recording:
+            time_since_speech = current_time - self.last_speech_time
+            if time_since_speech < Config.VAD_MAX_SILENCE_DURATION:
+                self.recording_buffer.append(audio_chunk)
+            else:
+                self.finalize_recording()
+        
+        processing_time = time.time() - start_time
+        self.chunk_processing_times.append(processing_time)
+        if len(self.chunk_processing_times) > 50:  # Reduced for Pi memory
+            self.chunk_processing_times.pop(0)
+    
+    def finalize_recording(self):
+        """Finalize recording and send for processing"""
+        if not self.recording_buffer:
+            return
+        
+        full_audio = np.concatenate(self.recording_buffer)
+        duration = len(full_audio) / self.sample_rate
+        
+        if duration >= Config.VAD_MIN_SPEECH_DURATION:
+            print(f"\rProcessing speech ({duration:.1f}s)...")
+            threading.Thread(target=self.callback, args=(full_audio,), daemon=True).start()
+        
+        self.is_recording = False
+        self.recording_buffer = []
+    
+    def start_stream(self):
+        """Start real-time audio stream"""
+        try:
+            self.stream = sd.InputStream(
+                callback=self.audio_callback,
+                samplerate=self.sample_rate,
+                channels=Config.CHANNELS,
+                dtype=Config.DTYPE,
+                blocksize=self.chunk_size,
+                latency='low'
+            )
+            self.stream.start()
+            print("Krishna AI Assistant listening - Optimized for Raspberry Pi...")
+            return True
+        except Exception as e:
+            print(f"Failed to start audio stream: {e}")
+            return False
+    
+    def stop_stream(self):
+        """Stop audio stream"""
+        if hasattr(self, 'stream'):
+            self.stream.stop()
+            self.stream.close()
+    
+    def get_performance_stats(self) -> Dict:
+        """Get processing performance statistics"""
+        if not self.chunk_processing_times:
+            return {"avg_processing_time": 0, "max_processing_time": 0}
+        return {
+            "avg_processing_time": np.mean(self.chunk_processing_times),
+            "max_processing_time": np.max(self.chunk_processing_times),
+            "chunk_count": len(self.chunk_processing_times)
         }
 
-class RedundantTTS:
-    """Multi-layer TTS system with automatic failover"""
-    
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
-        self.primary_engine = None
-        self.backup_engines = []
-        self.current_engine_type = None
-        self.initialize_engines()
-    
-    def initialize_engines(self):
-        """Initialize all available TTS engines in priority order"""
-        
-        # Priority 1: gTTS (high quality, requires internet)
-        if GTTS_AVAILABLE:
-            try:
-                # Test gTTS with a dummy call
-                test_tts = gTTS(text="test", lang='en', slow=False)
-                self.primary_engine = ("gtts", None)
-                self.current_engine_type = "gtts"
-                self.logger.info(" Primary TTS: gTTS initialized")
-            except Exception as e:
-                self.logger.error(f"gTTS initialization failed: {e}")
-        
-        # Priority 2: Windows SAPI (fastest, most reliable for Windows)
-        if SAPI_AVAILABLE and platform.system() == "Windows":
-            try:
-                engine = win32com.client.Dispatch("SAPI.SpVoice")
-                if not self.primary_engine:
-                    self.primary_engine = ("sapi", engine)
-                    self.current_engine_type = "sapi"
-                    self.logger.info(" Primary TTS: Windows SAPI initialized")
-                else:
-                    self.backup_engines.append(("sapi", engine))
-                    self.logger.info(" Backup TTS: Windows SAPI ready")
-            except Exception as e:
-                self.logger.error(f"SAPI initialization failed: {e}")
-        
-        if not self.primary_engine:
-            raise RuntimeError(" CRITICAL: No TTS engines available!")
-    
-    def speak(self, text: str, timeout: float = 10.0) -> bool:
-        """Speak text with automatic failover"""
-        if not text or len(text.strip()) == 0:
-            return False
-        
-        text = text.strip()
-        self.logger.info(f" Speaking: {text}")
-        
-        # Try primary engine first
-        if self._try_speak_with_engine(self.primary_engine, text, timeout):
-            return True
-        
-        # If primary fails, try backup engines
-        for engine_info in self.backup_engines:
-            self.logger.warning(f"Primary TTS failed, trying backup: {engine_info[0]}")
-            if self._try_speak_with_engine(engine_info, text, timeout):
-                # Promote successful backup to primary
-                self.backup_engines.remove(engine_info)
-                self.backup_engines.append(self.primary_engine)
-                self.primary_engine = engine_info
-                self.current_engine_type = engine_info[0]
-                return True
-        
-        # All engines failed
-        self.logger.error(" ALL TTS ENGINES FAILED")
-        return False
-    
-    def _try_speak_with_engine(self, engine_info: Tuple, text: str, timeout: float) -> bool:
-        """Try speaking with a specific engine"""
-        engine_type, engine = engine_info
-        
-        try:
-            if engine_type == "sapi":
-                engine.Speak(text)
-                return True
-            
-            elif engine_type == "gtts":
-                return self._speak_with_gtts(text, timeout)
-        
-        except Exception as e:
-            self.logger.error(f"TTS engine {engine_type} failed: {e}")
-            return False
-        
-        return False
-    
-    def _speak_with_gtts(self, text: str, timeout: float) -> bool:
-        """Speak using Google Text-to-Speech"""
-        temp_filename = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
-                temp_filename = fp.name
-            
-            # Split long text into smaller chunks to avoid gTTS rate limits
-            max_chunk_length = 500
-            if len(text) > max_chunk_length:
-                chunks = [text[i:i+max_chunk_length] for i in range(0, len(text), max_chunk_length)]
-            else:
-                chunks = [text]
-            
-            # Generate and save each chunk
-            for i, chunk in enumerate(chunks):
-                tts = gTTS(text=chunk, lang='en', slow=False)
-                chunk_filename = f"{temp_filename}_{i}.mp3"
-                tts.save(chunk_filename)
-                
-                # Play the audio file using pygame
-                pygame.mixer.music.load(chunk_filename)
-                pygame.mixer.music.play()
-                
-                # Wait for the audio to finish playing
-                while pygame.mixer.music.get_busy():
-                    pygame.time.Clock().tick(10)
-                
-                # Clean up the chunk file
-                pygame.mixer.music.unload()
-                try:
-                    os.unlink(chunk_filename)
-                except:
-                    pass
-                
-            return True
-            
-        except Exception as e:
-            self.logger.error(f"gTTS error: {e}")
-            if temp_filename and os.path.exists(temp_filename):
-                try:
-                    os.unlink(temp_filename)
-                except:
-                    pass
-            return False
-        
-        return False
-
-class VoiceActivityDetector:
-    """Advanced Voice Activity Detection"""
-    
-    def __init__(self, sample_rate: int = Config.SAMPLE_RATE):
-        self.sample_rate = sample_rate
-        self.frame_duration = 0.02  # 20ms frames
-        self.frame_size = int(sample_rate * self.frame_duration)
-        
-    def detect_speech_segments(self, audio: np.ndarray) -> List[Tuple[float, float]]:
-        """Detect speech segments in audio"""
-        # Simple energy-based VAD
-        frame_count = len(audio) // self.frame_size
-        energy_threshold = np.mean(np.abs(audio)) * 2
-        
-        segments = []
-        in_speech = False
-        speech_start = 0
-        
-        for i in range(frame_count):
-            frame_start = i * self.frame_size
-            frame_end = min(frame_start + self.frame_size, len(audio))
-            frame = audio[frame_start:frame_end]
-            
-            frame_energy = np.mean(np.abs(frame))
-            
-            if frame_energy > energy_threshold and not in_speech:
-                in_speech = True
-                speech_start = frame_start / self.sample_rate
-            elif frame_energy <= energy_threshold and in_speech:
-                in_speech = False
-                speech_end = frame_start / self.sample_rate
-                if speech_end - speech_start > Config.MIN_RECORDING_LENGTH:
-                    segments.append((speech_start, speech_end))
-        
-        # Handle case where speech continues to end
-        if in_speech:
-            segments.append((speech_start, len(audio) / self.sample_rate))
-        
-        return segments
-
-class OllamaLLM:
-    """Ollama LLM integration with error handling and retries"""
-    
-    def __init__(self):
-        self.logger = logging.getLogger(__name__)
-        self.model_name = Config.OLLAMA_MODEL
-        self.base_url = Config.OLLAMA_URL
-        self.timeout = Config.OLLAMA_TIMEOUT
-        self.test_connection()
-    
-    def test_connection(self):
-        """Test Ollama connection and model availability"""
-        try:
-            self.logger.info("Testing Ollama connection...")
-            
-            # Test server connection
-            tags_url = "http://localhost:11434/api/tags"
-            response = requests.get(tags_url, timeout=5)
-            
-            if response.status_code != 200:
-                raise Exception(f"Ollama server responded with status {response.status_code}")
-            
-            # Check available models
-            models_data = response.json()
-            available_models = [model["name"] for model in models_data.get("models", [])]
-            
-            # Check if our model is available
-            model_found = False
-            for model_name in available_models:
-                if self.model_name in model_name:
-                    model_found = True
-                    self.model_name = model_name  # Use exact model name
-                    break
-            
-            if not model_found:
-                self.logger.error(f"Available models: {available_models}")
-                raise Exception(f"Model '{self.model_name}' not found. Available: {available_models}")
-            
-            # Test generation
-            test_response = self._call_ollama("Test connection")
-            if not test_response:
-                raise Exception("Test generation failed")
-            
-            self.logger.info(f"âœ… Ollama connected successfully with model: {self.model_name}")
-            
-        except requests.exceptions.ConnectionError:
-            raise Exception("Ollama server not running. Please start with 'ollama serve'")
-        except Exception as e:
-            self.logger.error(f"Ollama connection failed: {e}")
-            raise
-    
-    def _call_ollama(self, prompt: str, max_retries: int = 3) -> Optional[str]:
-        """Make API call to Ollama with retries"""
-        for attempt in range(max_retries):
-            try:
-                payload = {
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {
-                        "temperature": Config.TEMPERATURE,
-                        "top_p": Config.TOP_P,
-                        "num_predict": Config.MAX_TOKENS,
-                        "repeat_penalty": Config.REPETITION_PENALTY,
-                        "stop": ["Human:", "User:", "Krishna:", "\n\n", ".", "!", "?"]
-                    }
-                }
-                
-                response = requests.post(
-                    self.base_url,
-                    json=payload,
-                    timeout=self.timeout
-                )
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    return result.get("response", "").strip()
-                else:
-                    self.logger.error(f"Ollama API error: {response.status_code} - {response.text}")
-                    
-            except requests.exceptions.Timeout:
-                self.logger.warning(f"Ollama timeout on attempt {attempt + 1}")
-            except Exception as e:
-                self.logger.error(f"Ollama API call failed on attempt {attempt + 1}: {e}")
-            
-            if attempt < max_retries - 1:
-                time.sleep(1)  # Brief delay before retry
-        
-        return None
-    
-    def generate(self, prompt: str) -> Optional[str]:
-        """Generate response with the LLM"""
-        return self._call_ollama(prompt)
-
-class AerospaceVoiceAssistant:
-    """Main voice assistant class with aerospace-grade reliability and dual modes"""
+class KrishnaRaspberryPiAssistant:
+    """Complete Krishna AI assistant optimized for Raspberry Pi"""
     
     def __init__(self):
         self.setup_logging()
         self.logger = logging.getLogger(__name__)
         
-        # System components
-        self.health_monitor = SystemHealthMonitor()
-        self.tts_system = RedundantTTS()
-        self.vad = VoiceActivityDetector()
+        # Check systems
+        self.check_audio_devices()
         
-        # Initialize Ollama LLM
-        self.llm = OllamaLLM()
-        
-        # Mode management
-        self.current_mode = "TEST"  # Start in test mode
-        self.is_assistant_awake = True  # For assistant mode sleep/wake
-        self.is_sleeping = False  # New: Sleep state for shutdown/wake cycle
-        
-        # State management
+        # Core systems
+        self.current_mode = "TEST"
+        self.is_sleeping = False
         self.is_running = True
-        self.continuous_listening = False
-        self.last_interaction = time.time()
+        self.audio_processor = None
         
-        # Audio processing
-        self.audio_queue = queue.Queue()
-        self.response_queue = queue.Queue()
+        # Advanced AI components
+        self.search_engine = WebSearchEngine()
+        self.response_generator = None  # Initialize after models load
+        self.tts_handler = GTTSHandler()
         
-        # Initialize AI models
+        # Processing pipeline - reduced for Pi
+        self.transcription_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.llm_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        
+        # Performance tracking
+        self.response_times = []
+        self.successful_interactions = 0
+        self.failed_interactions = 0
+        self.search_queries_made = 0
+        
+        # Initialize AI systems
         self.initialize_models()
         
-        # Start background processes
-        self.start_background_threads()
+        # Initialize intelligent response generator
+        self.response_generator = IntelligentResponseGenerator(self.llm, self.search_engine)
         
-        self.logger.info("ðŸš€ Krishna Voice Assistant - Aerospace Grade - DUAL MODE - ONLINE")
+        print("Krishna Assistant for Raspberry Pi - Ready!")
+        print("Features: Voice processing, Intelligent conversations, Web search, gTTS")
     
     def setup_logging(self):
-        """Configure comprehensive logging with Unicode support"""
-        log_format = '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
-        
-        # Clear any existing handlers
-        logging.getLogger().handlers.clear()
-        
-        # Create handlers with UTF-8 encoding
-        file_handler = logging.FileHandler('krishna_assistant.log', encoding='utf-8')
-        file_handler.setFormatter(logging.Formatter(log_format))
-        
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(logging.Formatter(log_format))
-        
-        # For Windows, set the console to handle UTF-8
-        if platform.system() == "Windows":
-            try:
-                import io
-                sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-                sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-            except:
-                # Fallback: Remove emojis from console output for Windows
-                console_handler = logging.StreamHandler(sys.stdout)
-                console_handler.addFilter(self._emoji_filter)
-                console_handler.setFormatter(logging.Formatter(log_format))
+        """Setup logging for Pi"""
+        log_dir = "/tmp/krishna_logs"
+        os.makedirs(log_dir, exist_ok=True)
         
         logging.basicConfig(
-            level=Config.LOG_LEVEL,
-            format=log_format,
-            handlers=[file_handler, console_handler]
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(f'{log_dir}/krishna_pi.log'),
+                logging.StreamHandler()
+            ]
         )
     
-    def _emoji_filter(self, record):
-        """Filter to remove emojis for Windows console compatibility"""
-        # Replace common emojis with text equivalents
-        emoji_replacements = {
-            'âœ…': '[OK]',
-            'âŒ': '[ERROR]',
-            'ðŸ“': '[TRANSCRIBE]',
-            'ðŸ—£ï¸': '[SPEAK]',
-            'ðŸ’š': '[HEALTH]',
-            'ðŸŽ™ï¸': '[MIC]',
-            'ðŸ¤–': '[ROBOT]',
-            'âš ï¸': '[WARNING]',
-            'ðŸ›‘': '[STOP]',
-            'ðŸš€': '[START]',
-            'ðŸ§ ': '[AI]',
-            'ðŸ’¥': '[CRITICAL]',
-            'ðŸ”‡': '[MUTE]',
-            'ðŸ˜´': '[SLEEP]',
-            'ðŸ‘‚': '[LISTEN]'
-        }
-        
-        message = record.getMessage()
-        for emoji, replacement in emoji_replacements.items():
-            message = message.replace(emoji, replacement)
-        record.msg = message
-        record.args = ()
-        return True
+    def check_audio_devices(self):
+        """Check and configure audio devices for Pi"""
+        try:
+            devices = sd.query_devices()
+            print("Available audio input devices:")
+            for i, device in enumerate(devices):
+                if device['max_input_channels'] > 0:
+                    print(f"  {i}: {device['name']}")
+            
+            # Try to set a reasonable default for Pi
+            default_input = sd.default.device[0]
+            if default_input is None:
+                for i, device in enumerate(devices):
+                    if device['max_input_channels'] > 0 and 'usb' in device['name'].lower():
+                        sd.default.device[0] = i
+                        print(f"Set default input device to: {device['name']}")
+                        break
+        except Exception as e:
+            print(f"Audio device check failed: {e}")
     
     def initialize_models(self):
-        """Initialize AI models with error handling"""
-        self.logger.info("ðŸ§  Initializing AI models...")
+        """Initialize AI models for Pi"""
+        print("Loading AI models for Raspberry Pi (this will take a moment)...")
         
-        # Initialize Whisper
+        # Load Whisper with tiny model
         try:
             self.whisper_model = whisper.load_model(Config.WHISPER_MODEL)
-            self.logger.info("âœ… Whisper model loaded successfully")
+            print(f"✓ Whisper {Config.WHISPER_MODEL} loaded (Pi optimized)")
         except Exception as e:
-            self.logger.critical(f"âŒ Failed to load Whisper model: {e}")
+            print(f"✗ Whisper loading failed: {e}")
+            raise
+        
+        # Load TinyLlama with Pi optimizations
+        try:
+            if not os.path.exists(Config.TINYLLAMA_PATH):
+                print(f"Model not found at: {Config.TINYLLAMA_PATH}")
+                print("Please download the model to the specified path")
+                print("Or update TINYLLAMA_PATH in Config class")
+                raise FileNotFoundError(f"Model not found: {Config.TINYLLAMA_PATH}")
+            
+            self.llm = AutoModelForCausalLM.from_pretrained(
+                Config.TINYLLAMA_PATH,
+                max_new_tokens=Config.MAX_TOKENS,
+                temperature=Config.TEMPERATURE,
+                top_p=Config.TOP_P,
+                context_length=Config.CONTEXT_LENGTH,
+                threads=2,  # Reduced for Pi
+                repetition_penalty=Config.REPETITION_PENALTY,
+                stop=["Human:", "User:", "Krishna:", "\n"]
+            )
+            print("✓ TinyLlama loaded (Pi optimized)")
+        except Exception as e:
+            print(f"✗ TinyLlama loading failed: {e}")
             raise
     
-    def start_background_threads(self):
-        """Start background processing threads"""
-        # Audio processing thread
-        self.audio_thread = threading.Thread(target=self.process_audio_queue, daemon=True)
-        self.audio_thread.start()
-        
-        # Response processing thread
-        self.response_thread = threading.Thread(target=self.process_response_queue, daemon=True)
-        self.response_thread.start()
-        
-        # Health monitoring thread
-        self.health_thread = threading.Thread(target=self.health_monitor_loop, daemon=True)
-        self.health_thread.start()
-        
-        # Assistant mode continuous listening thread
-        self.assistant_thread = threading.Thread(target=self.assistant_mode_loop, daemon=True)
-        self.assistant_thread.start()
+    def speak_intelligent(self, text: str):
+        """Speak text using gTTS"""
+        try:
+            self.tts_handler.speak(text)
+        except Exception as e:
+            print(f"TTS error: {e}")
+            print(f"[Krishna]: {text}")
     
-    def switch_mode(self, new_mode: str):
-        """Switch between Assistant and Test modes"""
+    def process_intelligent_audio(self, audio_data: np.ndarray):
+        """Process audio with Pi-optimized AI capabilities"""
+        start_time = time.time()
+        
+        try:
+            # Transcription
+            transcription_future = self.transcription_executor.submit(
+                self.transcribe_audio_optimized, audio_data
+            )
+            
+            try:
+                text = transcription_future.result(timeout=Config.MAX_PROCESSING_TIME)
+            except concurrent.futures.TimeoutError:
+                print("Transcription timeout - please try again")
+                self.failed_interactions += 1
+                return
+            
+            if not text:
+                return
+            
+            print(f"You said: \"{text}\"")
+            
+            # Handle system commands first
+            if self.handle_system_commands(text):
+                return
+            
+            # Generate intelligent response
+            if not self.is_sleeping:
+                try:
+                    # Use the intelligent response generator
+                    response = self.response_generator.generate_enhanced_response(text)
+                    
+                    if response:
+                        print(f"Krishna: {response}")
+                        self.speak_intelligent(response)
+                        
+                        # Update conversation context
+                        self.response_generator.update_context(text, response)
+                        
+                        # Track performance
+                        elapsed = time.time() - start_time
+                        self.response_times.append(elapsed)
+                        self.successful_interactions += 1
+                        
+                        # Check if search was used
+                        if self.response_generator.conversation_context.last_search_time:
+                            if self.response_generator.conversation_context.last_search_time >= datetime.now() - timedelta(seconds=10):
+                                self.search_queries_made += 1
+                        
+                        print(f"Response time: {elapsed:.3f}s")
+                        
+                except Exception as e:
+                    print(f"Response generation error: {e}")
+                    self.speak_intelligent("I'm having some processing difficulties. Please try again.")
+                    self.failed_interactions += 1
+        
+        except Exception as e:
+            print(f"Audio processing error: {e}")
+            self.failed_interactions += 1
+    
+    def transcribe_audio_optimized(self, audio_data: np.ndarray) -> Optional[str]:
+        """Optimized transcription for Pi"""
+        try:
+            # Use temporary file in RAM disk if available
+            temp_dir = "/tmp" if os.path.exists("/tmp") else "."
+            temp_file = os.path.join(temp_dir, f"temp_audio_{threading.get_ident()}.wav")
+            
+            # Convert and save audio
+            audio_int16 = (audio_data * 32767).astype(np.int16)
+            with wave.open(temp_file, 'wb') as wf:
+                wf.setnchannels(Config.CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(Config.SAMPLE_RATE)
+                wf.writeframes(audio_int16.tobytes())
+            
+            # Transcribe with Whisper
+            result = self.whisper_model.transcribe(
+                temp_file, 
+                fp16=False,
+                verbose=False,
+                language='en'
+            )
+            
+            text = result["text"].strip()
+            
+            # Cleanup temp file
+            try:
+                os.remove(temp_file)
+            except:
+                pass
+            
+            # Validate transcription quality
+            if len(text) < 2 or len(text.split()) < 1:
+                return None
+            
+            return text
+            
+        except Exception as e:
+            print(f"Transcription error: {e}")
+            return None
+    
+    def handle_system_commands(self, text: str) -> bool:
+        """Handle system-level commands optimized for Pi"""
+        text_lower = text.lower().strip()
+        
+        # Emergency handling first
+        if any(word in text_lower for word in Config.EMERGENCY_WORDS):
+            self.speak_intelligent("Emergency protocols activated. How can I assist you?")
+            return True
+        
+        # Wake commands
+        for wake_word in Config.ASSISTANT_WAKE_WORDS:
+            if wake_word in text_lower:
+                if self.is_sleeping:
+                    self.is_sleeping = False
+                    print("System awakening...")
+                    self.speak_intelligent("Hello! I'm awake and ready to assist.")
+                    return True
+                else:
+                    self.speak_intelligent("I'm already active and listening.")
+                    return True
+        
+        # Sleep commands
+        for sleep_word in Config.ASSISTANT_SLEEP_WORDS:
+            if sleep_word in text_lower:
+                self.is_sleeping = True
+                print("Entering sleep mode...")
+                self.speak_intelligent("Entering sleep mode. Say hello Krishna to wake me up.")
+                return True
+        
+        # Mode switching
+        if "assistant mode" in text_lower:
+            if self.switch_mode("ASSISTANT"):
+                self.speak_intelligent("Assistant mode activated. Real-time processing enabled.")
+                return True
+        elif "test mode" in text_lower:
+            if self.switch_mode("TEST"):
+                self.speak_intelligent("Test mode activated.")
+                return True
+        
+        # System status and information
+        if "system status" in text_lower or "health check" in text_lower:
+            self.provide_system_status()
+            return True
+        
+        if "capabilities" in text_lower or "what can you do" in text_lower:
+            self.explain_capabilities()
+            return True
+        
+        # Pi-specific commands
+        if "temperature" in text_lower and "pi" in text_lower:
+            self.get_pi_temperature()
+            return True
+            
+        if "memory usage" in text_lower:
+            self.get_memory_usage()
+            return True
+        
+        return False
+    
+    def get_pi_temperature(self):
+        """Get Raspberry Pi CPU temperature"""
+        try:
+            with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                temp_raw = f.read().strip()
+                temp_c = int(temp_raw) / 1000
+                temp_f = (temp_c * 9/5) + 32
+                
+            status_msg = f"Pi CPU temperature: {temp_c:.1f}°C ({temp_f:.1f}°F)"
+            print(status_msg)
+            
+            if temp_c > 70:
+                self.speak_intelligent(f"CPU temperature is {temp_c:.0f} degrees Celsius. Consider cooling.")
+            else:
+                self.speak_intelligent(f"CPU temperature is {temp_c:.0f} degrees Celsius. Normal.")
+                
+        except Exception as e:
+            print(f"Temperature check error: {e}")
+            self.speak_intelligent("Unable to check CPU temperature.")
+    
+    def get_memory_usage(self):
+        """Get memory usage information"""
+        try:
+            # Get memory info
+            with open('/proc/meminfo', 'r') as f:
+                meminfo = f.read()
+            
+            mem_total = int([line for line in meminfo.split('\n') if 'MemTotal' in line][0].split()[1]) // 1024
+            mem_available = int([line for line in meminfo.split('\n') if 'MemAvailable' in line][0].split()[1]) // 1024
+            mem_used = mem_total - mem_available
+            mem_percent = (mem_used / mem_total) * 100
+            
+            status_msg = f"Memory usage: {mem_used}MB / {mem_total}MB ({mem_percent:.1f}%)"
+            print(status_msg)
+            self.speak_intelligent(f"Memory usage is {mem_percent:.0f} percent.")
+            
+        except Exception as e:
+            print(f"Memory check error: {e}")
+            self.speak_intelligent("Unable to check memory usage.")
+    
+    def provide_system_status(self):
+        """Provide Pi-optimized system status"""
+        avg_response = np.mean(self.response_times) if self.response_times else 0
+        success_rate = self.successful_interactions / max(1, self.successful_interactions + self.failed_interactions)
+        uptime = datetime.now() - self.response_generator.conversation_context.current_session_start
+        
+        status_msg = f"""Pi System Status: All systems operational. 
+        Success rate: {success_rate:.1%}. 
+        Average response time: {avg_response:.2f}s. 
+        Search queries: {self.search_queries_made}. 
+        Session uptime: {str(uptime).split('.')[0]}."""
+        
+        print(status_msg)
+        self.speak_intelligent(f"All systems operational. Success rate {success_rate:.0%}. Response time {avg_response:.1f} seconds.")
+    
+    def explain_capabilities(self):
+        """Explain Pi system capabilities"""
+        capabilities_msg = """Krishna AI Assistant for Raspberry Pi:
+        - Real-time voice processing optimized for ARM
+        - Intelligent conversations with context memory
+        - Web search integration for current information
+        - gTTS text-to-speech system
+        - Pi hardware monitoring
+        - Energy-efficient operation"""
+        
+        print(capabilities_msg)
+        self.speak_intelligent("I offer voice processing, intelligent conversations, web search, and Pi system monitoring.")
+    
+    def switch_mode(self, new_mode: str) -> bool:
+        """Switch between operating modes"""
         if new_mode.upper() not in ["ASSISTANT", "TEST"]:
             return False
         
@@ -531,697 +1001,339 @@ class AerospaceVoiceAssistant:
         self.current_mode = new_mode.upper()
         
         if old_mode != self.current_mode:
-            self.logger.info(f"ðŸ”„ Mode switched: {old_mode} â†’ {self.current_mode}")
+            print(f"Mode switched: {old_mode} -> {self.current_mode}")
             
             if self.current_mode == "ASSISTANT":
-                self.continuous_listening = True
-                self.is_sleeping = False
-                self.tts_system.speak("Assistant mode activated. Autonomous operation initiated. I am now listening continuously.")
+                self.start_pi_assistant_mode()
             else:
-                self.continuous_listening = False
-                self.is_sleeping = False
-                self.tts_system.speak("Test mode activated. Manual interaction mode enabled.")
+                self.stop_assistant_mode()
         
         return True
     
-    def enter_sleep_mode(self):
-        """Enter sleep mode - stops active listening but keeps wake word detection"""
-        self.is_sleeping = True
-        self.continuous_listening = False
-        self.is_assistant_awake = False
-        self.health_monitor.log_sleep_wake_cycle()
-        self.logger.info("ðŸ˜´ Entering sleep mode - Wake word detection active")
+    def start_pi_assistant_mode(self):
+        """Start Pi-optimized assistant mode"""
+        if self.audio_processor:
+            return
         
-        if self.current_mode == "ASSISTANT":
-            self.tts_system.speak("Entering sleep mode. Say 'Hello Krishna' to wake me up.")
+        print("Initializing Pi AI Assistant Mode...")
+        print("Features: Real-time voice, Context awareness, Web search, gTTS")
+        
+        self.audio_processor = RealTimeAudioProcessor(
+            callback=self.process_intelligent_audio
+        )
+        
+        success = self.audio_processor.start_stream()
+        if success:
+            self.speak_intelligent("Assistant mode active on Raspberry Pi.")
         else:
-            self.tts_system.speak("System sleeping. Say 'Hello Krishna' to wake up.")
+            print("Failed to start assistant mode")
     
-    def wake_up(self):
-        """Wake up from sleep mode"""
-        self.is_sleeping = False
-        if self.current_mode == "ASSISTANT":
-            self.continuous_listening = True
-            self.is_assistant_awake = True
-        self.logger.info("ðŸ‘‚ Waking up - Resuming normal operation")
-        self.tts_system.speak("Hello! I'm awake and ready to assist you.")
+    def stop_assistant_mode(self):
+        """Stop assistant mode"""
+        if self.audio_processor:
+            self.audio_processor.stop_stream()
+            self.audio_processor = None
+            print("Assistant mode stopped")
     
-    def check_for_wake_words(self, text: str) -> bool:
-        """Check if text contains wake words when sleeping"""
-        if not self.is_sleeping:
-            return False
-        
-        text_lower = text.lower().strip()
-        for wake_word in Config.ASSISTANT_WAKE_WORDS:
-            if wake_word in text_lower:
-                self.logger.info(f"ðŸ‘‚ Wake word detected: '{wake_word}' in '{text}'")
-                return True
-        return False
-    
-    def assistant_mode_loop(self):
-        """Continuous listening loop for Assistant mode with sleep/wake support"""
-        while self.is_running:
-            try:
-                if self.current_mode == "ASSISTANT":
-                    if self.is_sleeping:
-                        # Sleep mode - only listen for wake words
-                        print(f"\rðŸ˜´ [SLEEP MODE] Listening for wake words... {datetime.now().strftime('%H:%M:%S')}", end="")
-                        
-                        # Record audio with longer intervals
-                        audio_data = self.record_audio_sleep_mode()
-                        
-                        if audio_data is not None:
-                            # Only check for wake words
-                            text = self.transcribe_audio(audio_data)
-                            if text and self.check_for_wake_words(text):
-                                self.wake_up()
-                        
-                        time.sleep(Config.SLEEP_MODE_LISTENING_INTERVAL)
-                        
-                    elif self.continuous_listening and self.is_assistant_awake:
-                        # Normal assistant mode
-                        print(f"\rðŸ¤– [ASSISTANT MODE] Listening... {datetime.now().strftime('%H:%M:%S')}", end="")
-                        
-                        # Record audio automatically
-                        audio_data = self.record_audio_advanced()
-                        
-                        if audio_data is not None:
-                            self.audio_queue.put(audio_data)
-                            self.last_interaction = time.time()
-                        
-                        # Wait before next listening cycle
-                        time.sleep(Config.ASSISTANT_CONTINUOUS_LISTENING_INTERVAL)
-                    else:
-                        time.sleep(1)  # Sleep when not listening
-                else:
-                    # Test mode - check for sleep mode
-                    if self.is_sleeping:
-                        print(f"\rðŸ˜´ [TEST MODE - SLEEPING] Say 'Hello Krishna' to wake... {datetime.now().strftime('%H:%M:%S')}", end="")
-                        
-                        audio_data = self.record_audio_sleep_mode()
-                        if audio_data is not None:
-                            text = self.transcribe_audio(audio_data)
-                            if text and self.check_for_wake_words(text):
-                                self.wake_up()
-                        
-                        time.sleep(Config.SLEEP_MODE_LISTENING_INTERVAL)
-                    else:
-                        time.sleep(1)  # Normal test mode - no continuous listening
-                    
-            except Exception as e:
-                self.logger.error(f"Assistant mode loop error: {e}")
-                time.sleep(5)  # Longer sleep on error
-    
-    def record_audio_sleep_mode(self) -> Optional[np.ndarray]:
-        """Simplified audio recording for sleep mode wake word detection"""
-        try:
-            # Shorter recording for wake word detection
-            recording = []
-            
-            with sd.InputStream(
-                samplerate=Config.SAMPLE_RATE,
-                channels=Config.CHANNELS,
-                dtype=Config.DTYPE
-            ) as stream:
-                
-                # Record for shorter duration in sleep mode
-                duration = 3.0  # 3 seconds for wake words
-                frames = int(duration * Config.SAMPLE_RATE / 1024)
-                
-                for _ in range(frames):
-                    chunk, overflowed = stream.read(1024)
-                    chunk = chunk.flatten()
-                    recording.extend(chunk)
-                    
-                    # Check for basic voice activity
-                    chunk_energy = np.mean(np.abs(chunk))
-                    if chunk_energy > Config.SILENCE_THRESHOLD:
-                        # Continue recording if voice detected
-                        continue
-            
-            recording = np.array(recording, dtype=Config.DTYPE)
-            
-            # Basic validation
-            if len(recording) / Config.SAMPLE_RATE < 0.5:
-                return None
-            
-            return recording
-            
-        except Exception as e:
-            self.logger.error(f"Sleep mode audio recording failed: {e}")
-            return None
-    
-    def record_audio_advanced(self) -> Optional[np.ndarray]:
-        """Advanced audio recording with VAD"""
-        if self.current_mode == "TEST":
-            self.logger.info("ðŸŽ™ï¸ Starting manual audio capture...")
-        
-        try:
-            # Dynamic recording with voice activity detection
-            recording = []
-            silence_duration = 0
-            has_speech = False
-            
-            with sd.InputStream(
-                samplerate=Config.SAMPLE_RATE,
-                channels=Config.CHANNELS,
-                dtype=Config.DTYPE
-            ) as stream:
-                
-                start_time = time.time()
-                
-                while time.time() - start_time < Config.RECORD_DURATION:
-                    # Read audio chunk
-                    chunk, overflowed = stream.read(int(Config.SAMPLE_RATE * 0.1))
-                    chunk = chunk.flatten()
-                    recording.extend(chunk)
-                    
-                    # Check for speech
-                    chunk_energy = np.mean(np.abs(chunk))
-                    
-                    if chunk_energy > Config.SILENCE_THRESHOLD:
-                        silence_duration = 0
-                        has_speech = True
-                    else:
-                        silence_duration += 0.1
-                    
-                    # Stop if we have speech and then sufficient silence
-                    if has_speech and silence_duration >= Config.MAX_SILENCE_DURATION:
-                        break
-                    
-                    # Visual feedback (only in test mode)
-                    if self.current_mode == "TEST":
-                        elapsed = time.time() - start_time
-                        energy_bar = "â–ˆ" * min(20, int(chunk_energy * 1000))
-                        print(f"\rðŸŽ™ï¸ Recording [{elapsed:.1f}s]: {energy_bar:<20}", end="")
-            
-            if self.current_mode == "TEST":
-                print()  # New line after recording
-            
-            recording = np.array(recording, dtype=Config.DTYPE)
-            
-            # Validate recording
-            if len(recording) / Config.SAMPLE_RATE < Config.MIN_RECORDING_LENGTH:
-                if self.current_mode == "TEST":
-                    self.logger.warning("Recording too short")
-                return None
-            
-            if not has_speech:
-                if self.current_mode == "TEST":
-                    self.logger.info("No speech detected in recording")
-                return None
-            
-            self.logger.info(f"âœ… Audio captured: {len(recording)/Config.SAMPLE_RATE:.1f}s")
-            return recording
-            
-        except Exception as e:
-            self.logger.error(f"Audio recording failed: {e}")
-            self.health_monitor.log_error("recording")
-            return None
-    
-    def transcribe_audio(self, audio_data: np.ndarray) -> Optional[str]:
-        """Transcribe audio with error handling and validation"""
-        try:
-            # Save temporary audio file
-            temp_file = "temp_audio.wav"
-            
-            # Convert to int16 for WAV file
-            audio_int16 = (audio_data * 32767).astype(np.int16)
-            
-            with wave.open(temp_file, 'wb') as wf:
-                wf.setnchannels(Config.CHANNELS)
-                wf.setsampwidth(2)  # 16-bit
-                wf.setframerate(Config.SAMPLE_RATE)
-                wf.writeframes(audio_int16.tobytes())
-            
-            # Transcribe
-            result = self.whisper_model.transcribe(temp_file, fp16=False)
-            text = result["text"].strip()
-            
-            # Cleanup
-            try:
-                os.remove(temp_file)
-            except:
-                pass
-            
-            # Validate transcription
-            if len(text) < 2:
-                if self.current_mode == "TEST" and not self.is_sleeping:
-                    self.logger.info("Transcription too short")
-                return None
-            
-            # Get confidence score if available
-            confidence = 1.0
-            if "segments" in result and result["segments"]:
-                confidence = 1.0 - np.mean([seg.get("no_speech_prob", 0) for seg in result["segments"]])
-            
-            # Lower confidence threshold for wake words when sleeping
-            confidence_threshold = Config.WAKE_WORD_CONFIDENCE_THRESHOLD if self.is_sleeping else 0.3
-            
-            self.logger.info(f"ðŸ“ Transcribed: '{text}' (confidence: {confidence:.2f})")
-            
-            if confidence < confidence_threshold:
-                if self.current_mode == "TEST" and not self.is_sleeping:
-                    self.logger.warning("Low confidence transcription")
-                return None
-            
-            return text
-            
-        except Exception as e:
-            self.logger.error(f"Transcription failed: {e}")
-            self.health_monitor.log_error("transcription")
-            return None
-    
-    def generate_response(self, text: str) -> Optional[str]:
-        """Generate intelligent response with sleep/wake cycle support"""
-        try:
-            text_lower = text.lower().strip()
-            
-            # Handle wake words when sleeping
-            if self.is_sleeping and self.check_for_wake_words(text):
-                return "WAKE_UP"
-            
-            # Don't process other commands when sleeping (except wake words)
-            if self.is_sleeping:
-                return None
-            
-            # Handle mode switching
-            if any(phrase in text_lower for phrase in Config.MODE_SWITCH_WORDS):
-                if "assistant" in text_lower:
-                    if self.switch_mode("ASSISTANT"):
-                        return "ASSISTANT_MODE_ACTIVATED"
-                elif "test" in text_lower:
-                    if self.switch_mode("TEST"):
-                        return "TEST_MODE_ACTIVATED"
-                else:
-                    return f"Current mode: {self.current_mode}. Say 'assistant mode' or 'test mode' to switch."
-            
-            # Handle sleep commands
-            if any(word in text_lower for word in Config.ASSISTANT_SLEEP_WORDS):
-                return "SLEEP_MODE"
-            
-            # Handle wake/sleep commands (legacy support)
-            if self.current_mode == "ASSISTANT":
-                if any(word in text_lower for word in Config.ASSISTANT_WAKE_WORDS):
-                    if not self.is_assistant_awake:
-                        self.is_assistant_awake = True
-                        self.continuous_listening = True
-                        return "Krishna systems reactivated. Autonomous listening resumed."
-                    return "I am already active and listening."
-            
-            # Emergency handling
-            if any(word in text_lower for word in Config.EMERGENCY_WORDS):
-                return "Emergency protocols activated. Please specify the nature of your emergency."
-            
-            # Built-in commands
-            if "time" in text_lower:
-                return f"Current time is {datetime.now().strftime('%I:%M %p')}."
-            
-            if "date" in text_lower:
-                return f"Today is {datetime.now().strftime('%A, %B %d, %Y')}."
-            
-            if "status" in text_lower or "health" in text_lower:
-                status = self.health_monitor.get_status()
-                sleep_status = "SLEEPING" if self.is_sleeping else "AWAKE"
-                return f"System status: {status['system_status']}. Success rate: {status['success_rate']:.1%}. Mode: {self.current_mode}. State: {sleep_status}."
-            
-            if "mode" in text_lower and "current" in text_lower:
-                awake_status = "SLEEPING" if self.is_sleeping else ("AWAKE" if self.is_assistant_awake else "STANDBY")
-                return f"Current mode: {self.current_mode}. Assistant status: {awake_status}."
-            
-            # LLM generation with mode-aware personality using Ollama
-            if self.current_mode == "ASSISTANT":
-                prompt = f"Krishna is an autonomous aerospace robot assistant like those used by NASA and ISRO. Respond professionally in 8 words or less.\nHuman: {text}\nKrishna:"
-            else:
-                prompt = f"Krishna is a helpful test assistant. Answer concisely in 8 words or less.\nHuman: {text}\nKrishna:"
-            
-            response = self.llm.generate(prompt)
-            
-            if response:
-                # Clean and validate response
-                response = response.strip()
-                
-                # Remove unwanted prefixes
-                for prefix in ["Krishna:", "Assistant:", "AI:", "Human:"]:
-                    if response.startswith(prefix):
-                        response = response[len(prefix):].strip()
-                
-                # Limit word count
-                words = response.split()[:8]
-                response = ' '.join(words)
-                
-                # Add punctuation
-                if response and response[-1] not in '.!?':
-                    response += '.'
-                
-                # Validate response quality
-                if len(response) < 3 or response.count(' ') > 10:
-                    return "I need more information to assist you."
-                
-                return response
-            else:
-                self.health_monitor.log_error("ollama")
-                return "I'm experiencing processing difficulties. Please retry."
-            
-        except Exception as e:
-            self.logger.error(f"Response generation failed: {e}")
-            self.health_monitor.log_error("llm")
-            return "I'm experiencing processing difficulties. Please retry."
-        
-        return "I don't understand. Could you rephrase that?"
-    
-    def process_audio_queue(self):
-        """Process audio in background thread"""
-        while self.is_running:
-            try:
-                audio_data = self.audio_queue.get(timeout=1)
-                if audio_data is None:
-                    continue
-                
-                # Transcribe audio
-                text = self.transcribe_audio(audio_data)
-                if text:
-                    # Generate response
-                    response = self.generate_response(text)
-                    if response:
-                        self.response_queue.put(response)
-                        self.health_monitor.log_success()
-                
-                self.audio_queue.task_done()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                self.logger.error(f"Audio processing error: {e}")
-    
-    def process_response_queue(self):
-        """Process responses in background thread"""
-        while self.is_running:
-            try:
-                response = self.response_queue.get(timeout=1)
-                if response is None:
-                    continue
-                
-                if response == "SLEEP_MODE":
-                    self.enter_sleep_mode()
-                elif response == "WAKE_UP":
-                    self.wake_up()
-                elif response == "ASSISTANT_MODE_ACTIVATED":
-                    continue  # Mode switch handled in switch_mode()
-                elif response == "TEST_MODE_ACTIVATED":
-                    continue  # Mode switch handled in switch_mode()
-                else:
-                    # Speak response
-                    success = self.tts_system.speak(response)
-                    if not success:
-                        self.health_monitor.log_error("tts")
-                        if self.current_mode == "TEST":
-                            print(f"ðŸ”‡ TTS Failed - Text: {response}")
-                
-                self.response_queue.task_done()
-                
-            except queue.Empty:
-                continue
-            except Exception as e:
-                self.logger.error(f"Response processing error: {e}")
-    
-    def health_monitor_loop(self):
-        """Background health monitoring"""
-        while self.is_running:
-            try:
-                time.sleep(Config.HEALTH_CHECK_INTERVAL)
-                status = self.health_monitor.get_status()
-                
-                if status["system_status"] == "DEGRADED":
-                    self.logger.warning("âš ï¸ System performance degraded")
-                    if self.current_mode == "ASSISTANT" and not self.is_sleeping:
-                        self.tts_system.speak("System performance degraded. Consider maintenance.")
-                
-                # Log periodic status
-                sleep_status = "SLEEPING" if self.is_sleeping else "AWAKE"
-                self.logger.info(f"ðŸ’š Health Check: {status['successful_interactions']} interactions, "
-                               f"{status['success_rate']:.1%} success rate, Mode: {self.current_mode}, State: {sleep_status}")
-                
-            except Exception as e:
-                self.logger.error(f"Health monitoring error: {e}")
-    
-    def run_dual_mode_session(self):
-        """Main dual-mode session with sleep/wake support"""
-        print("ðŸš€ Krishna Voice Assistant - Aerospace Grade - DUAL MODE with SLEEP/WAKE - OLLAMA POWERED")
-        print("Modes: [a] Assistant (Autonomous) | [t] Test (Manual)")
-        print("Sleep/Wake: Say 'shutdown' to sleep | Say 'hello krishna' to wake")
-        print("Test Mode Commands: [ENTER] Record | [s] Status | [h] Health | [q] Quit")
-        print("=" * 80)
-        
-        # Initial setup
-        self.tts_system.speak("Krishna systems initialized with Ollama. Starting in test mode. Say 'shutdown' to sleep or 'hello krishna' to wake up.")
+    def run_pi_session(self):
+        """Main interactive session optimized for Pi"""
+        print("\n" + "="*60)
+        print("KRISHNA AI ASSISTANT - RASPBERRY PI EDITION")
+        print("="*60)
+        print("Features:")
+        print("   - Voice processing optimized for ARM")
+        print("   - Intelligent conversations with gTTS")
+        print("   - Web search integration")
+        print("   - Pi hardware monitoring")
+        print("="*60)
+        print("Commands: [a] Assistant | [t] Test | [s] Status | [h] Help | [q] Quit")
+        print("="*60)
         
         try:
             while self.is_running:
                 if self.current_mode == "ASSISTANT":
-                    # Assistant mode - autonomous operation
                     if self.is_sleeping:
-                        print(f"\nðŸ˜´ ASSISTANT MODE - SLEEPING")
-                        print("The assistant is sleeping and listening for 'hello krishna' to wake up.")
-                        print("Commands: [t] Switch to Test Mode | [w] Wake Up | [q] Quit")
-                        
-                        user_input = input(f"[Assistant Mode - SLEEPING]: ").strip().lower()
-                        
-                        if user_input == 'q':
-                            self.shutdown()
-                            break
-                        elif user_input == 't':
-                            self.switch_mode("TEST")
-                        elif user_input == 'w':
-                            self.wake_up()
-                        elif user_input == 's':
-                            self.print_status()
-                        elif user_input == 'h':
-                            self.print_detailed_health()
+                        print("\n🟡 ASSISTANT MODE - SLEEPING")
+                        print("   System monitoring for wake commands...")
                     else:
-                        print(f"\nðŸ¤– ASSISTANT MODE ACTIVE - Autonomous Operation")
-                        print("Commands: [t] Switch to Test Mode | [sleep] Put to Sleep | [s] Status | [q] Quit")
-                        
-                        user_input = input(f"[Assistant Mode - {'LISTENING' if self.continuous_listening else 'STANDBY'}]: ").strip().lower()
-                        
-                        if user_input == 'q':
-                            self.shutdown()
-                            break
-                        elif user_input == 't':
-                            self.switch_mode("TEST")
-                        elif user_input == 'sleep':
-                            self.enter_sleep_mode()
-                        elif user_input == 's':
-                            self.print_status()
-                        elif user_input == 'h':
-                            self.print_detailed_health()
+                        print(f"\n🟢 PI ASSISTANT MODE - ACTIVE")
+                        print("   Real-time voice processing with gTTS")
+                        if self.audio_processor:
+                            perf = self.audio_processor.get_performance_stats()
+                            print(f"   Audio processing: {perf['avg_processing_time']*1000:.1f}ms avg")
+                    
+                    user_input = input(f"\n[Assistant Mode]: ").strip().lower()
+                    
+                    if user_input == 'q':
+                        break
+                    elif user_input == 't':
+                        self.switch_mode("TEST")
+                    elif user_input == 's':
+                        self.print_pi_stats()
+                    elif user_input == 'h':
+                        self.print_pi_help()
+                    elif user_input == 'clear':
+                        self.clear_conversation_history()
+                    elif user_input == 'temp':
+                        self.get_pi_temperature()
+                    elif user_input == 'mem':
+                        self.get_memory_usage()
                 
                 else:
-                    # Test mode - manual operation
-                    if self.is_sleeping:
-                        print(f"\nðŸ˜´ TEST MODE - SLEEPING")
-                        print("The system is sleeping and listening for 'hello krishna' to wake up.")
-                        print("Commands: [a] Assistant Mode | [w] Wake Up | [q] Quit")
-                        
-                        user_input = input("\n[Test Mode - SLEEPING]: ").strip().lower()
-                        
-                        if user_input == 'q':
-                            self.shutdown()
-                            break
-                        elif user_input == 'a':
-                            self.switch_mode("ASSISTANT")
-                        elif user_input == 'w':
-                            self.wake_up()
-                        elif user_input == 's':
-                            self.print_status()
-                        elif user_input == 'h':
-                            self.print_detailed_health()
-                    else:
-                        print(f"\nðŸ§ª TEST MODE ACTIVE - Manual Operation")
-                        user_input = input("\n[ENTER] Record | [a] Assistant Mode | [sleep] Sleep | [s] Status | [h] Health | [o] Ollama Test | [q] Quit: ").strip().lower()
-                        
-                        if user_input == 'q':
-                            self.shutdown()
-                            break
-                        
-                        elif user_input == 'a':
-                            self.switch_mode("ASSISTANT")
-                            continue
-                        
-                        elif user_input == 'sleep':
-                            self.enter_sleep_mode()
-                            continue
-                        
-                        elif user_input == 's':
-                            self.print_status()
-                            continue
-                        
-                        elif user_input == 'h':
-                            self.print_detailed_health()
-                            continue
-                        
-                        elif user_input == 'o':
-                            self.test_ollama_direct()
-                            continue
-                        
-                        # Manual recording in test mode
-                        print("\n" + "="*50)
-                        audio_data = self.record_audio_advanced()
-                        
-                        if audio_data is not None:
-                            self.audio_queue.put(audio_data)
-                            self.last_interaction = time.time()
-                        else:
-                            print("âŒ No valid audio captured")
-                        
-                        print("="*50)
+                    print(f"\n🔵 TEST MODE - MANUAL OPERATION")
+                    user_input = input("\n[ENTER] Record | [a] Assistant | [s] Status | [h] Help | [q] Quit: ").strip().lower()
+                    
+                    if user_input == 'q':
+                        break
+                    elif user_input == 'a':
+                        self.switch_mode("ASSISTANT")
+                    elif user_input == 's':
+                        self.print_pi_stats()
+                    elif user_input == 'h':
+                        self.print_pi_help()
+                    elif user_input == '':
+                        self.manual_record_and_process()
+                    elif user_input.startswith('text:'):
+                        # Text input mode for testing
+                        test_text = user_input[5:].strip()
+                        if test_text:
+                            print(f"Processing text: \"{test_text}\"")
+                            response = self.response_generator.generate_enhanced_response(test_text)
+                            print(f"Krishna: {response}")
+                            self.speak_intelligent(response)
+                    elif user_input == 'temp':
+                        self.get_pi_temperature()
+                    elif user_input == 'mem':
+                        self.get_memory_usage()
         
         except KeyboardInterrupt:
-            print("\nðŸ›‘ Keyboard interrupt received")
-            self.shutdown()
+            print("\nShutdown initiated...")
+        finally:
+            self.pi_shutdown()
     
-    def test_ollama_direct(self):
-        """Test Ollama connection directly"""
-        print("\n" + "="*50)
-        print("ðŸ§ª OLLAMA DIRECT TEST")
-        print("="*50)
+    def manual_record_and_process(self):
+        """Manual recording for test mode"""
+        print("🎙 Recording for 4 seconds (Pi optimized)...")
         
-        test_prompt = "Hello, this is a connection test"
-        print(f"Testing with prompt: '{test_prompt}'")
+        recording = sd.rec(
+            int(4 * Config.SAMPLE_RATE),
+            samplerate=Config.SAMPLE_RATE,
+            channels=Config.CHANNELS,
+            dtype=Config.DTYPE
+        )
+        sd.wait()
         
-        try:
-            response = self.llm.generate(test_prompt)
-            if response:
-                print(f"âœ… Ollama Response: '{response}'")
-                self.tts_system.speak(response)
-            else:
-                print("âŒ Ollama test failed - no response")
-        except Exception as e:
-            print(f"âŒ Ollama test error: {e}")
-            self.logger.error(f"Ollama direct test failed: {e}")
-        
-        print("="*50)
+        audio_data = recording.flatten()
+        print("Processing with Pi AI capabilities...")
+        self.process_intelligent_audio(audio_data)
     
-    def print_status(self):
-        """Print current system status"""
-        status = self.health_monitor.get_status()
-        sleep_status = "SLEEPING" if self.is_sleeping else ("AWAKE" if self.is_assistant_awake else "STANDBY")
-        listening_status = "ACTIVE" if self.continuous_listening else "INACTIVE"
-        
+    def clear_conversation_history(self):
+        """Clear conversation history and context"""
+        self.response_generator.conversation_context.conversation_history = []
+        self.response_generator.conversation_context.recent_topics = []
+        print("Conversation history cleared.")
+        self.speak_intelligent("Conversation history cleared.")
+    
+    def print_pi_help(self):
+        """Print Pi-specific help information"""
+        help_text = """
+🤖 KRISHNA AI ASSISTANT - RASPBERRY PI HELP
+
+VOICE COMMANDS:
+• "Hello Krishna" / "Hey Krishna" - Wake up system
+• "Shutdown" / "Go to sleep" - Put system to sleep
+• "Assistant mode" / "Test mode" - Switch modes
+• "System status" - Get system status
+• "Temperature Pi" - Check CPU temperature
+• "Memory usage" - Check RAM usage
+
+CONSOLE COMMANDS:
+• [a] - Switch to Assistant Mode
+• [t] - Switch to Test Mode  
+• [s] - Show system statistics
+• [h] - Show this help
+• [q] - Quit application
+• [temp] - Check Pi temperature
+• [mem] - Check memory usage
+• [clear] - Clear conversation history
+• text: <message> - Process text input
+
+PI OPTIMIZATIONS:
+• Reduced model size (Whisper tiny)
+• gTTS with local caching
+• Memory usage monitoring
+• CPU temperature monitoring
+• ARM-optimized processing
+        """
+        print(help_text)
+    
+    def print_pi_stats(self):
+        """Print Pi-specific system statistics"""
         print(f"\n{'='*50}")
-        print(f"ðŸ¤– KRISHNA STATUS REPORT")
+        print(f"📊 RASPBERRY PI SYSTEM STATISTICS")
         print(f"{'='*50}")
-        print(f"Current Mode: {self.current_mode}")
-        print(f"System State: {sleep_status}")
-        print(f"Continuous Listening: {listening_status}")
-        print(f"System Status: {status['system_status']}")
-        print(f"Uptime: {status['uptime_formatted']}")
-        print(f"Success Rate: {status['success_rate']:.1%}")
-        print(f"Sleep/Wake Cycles: {status['sleep_wake_cycles']}")
-        print(f"TTS Engine: {self.tts_system.current_engine_type}")
-        print(f"LLM Model: {self.llm.model_name}")
-        print(f"Successful Interactions: {status['successful_interactions']}")
-        print(f"Ollama Failures: {status['ollama_failures']}")
-        print(f"{'='*50}")
-    
-    def print_detailed_health(self):
-        """Print detailed health information"""
-        status = self.health_monitor.get_status()
-        print(f"\n{'='*60}")
-        print(f"ðŸ¥ DETAILED SYSTEM HEALTH")
-        print(f"{'='*60}")
-        for key, value in status.items():
-            print(f"{key.replace('_', ' ').title()}: {value}")
-        print(f"Sleep State: {'SLEEPING' if self.is_sleeping else 'AWAKE'}")
-        print(f"Ollama Model: {self.llm.model_name}")
-        print(f"{'='*60}")
-    
-    def shutdown(self):
-        """Graceful shutdown - completely terminates the program"""
-        self.logger.info("ðŸ›‘ Initiating graceful shutdown...")
-        self.is_running = False
-        self.continuous_listening = False
         
-        # Final status report
-        status = self.health_monitor.get_status()
-        self.logger.info(f"Final stats: {status['successful_interactions']} interactions, "
-                        f"{status['success_rate']:.1%} success rate, {status['sleep_wake_cycles']} sleep/wake cycles")
+        # Basic stats
+        success_rate = self.successful_interactions / max(1, self.successful_interactions + self.failed_interactions)
+        avg_response = np.mean(self.response_times) if self.response_times else 0
+        uptime = datetime.now() - self.response_generator.conversation_context.current_session_start
         
-        shutdown_message = f"Krishna systems shutting down completely. Final mode: {self.current_mode}. Ollama powered session complete. All systems safed."
-        self.tts_system.speak(shutdown_message)
+        print(f"System Mode: {self.current_mode}")
+        print(f"System State: {'SLEEPING' if self.is_sleeping else 'ACTIVE'}")
+        print(f"Session Uptime: {str(uptime).split('.')[0]}")
+        print(f"Success Rate: {success_rate:.1%}")
+        print(f"Successful Interactions: {self.successful_interactions}")
+        print(f"Failed Interactions: {self.failed_interactions}")
         
-        # Wait for threads to finish
+        # Performance metrics
+        if self.response_times:
+            max_response = np.max(self.response_times)
+            min_response = np.min(self.response_times)
+            
+            print(f"\nPerformance Metrics:")
+            print(f"Average Response Time: {avg_response:.3f}s")
+            print(f"Best Response Time: {min_response:.3f}s")
+            print(f"Worst Response Time: {max_response:.3f}s")
+        
+        # AI-specific stats
+        print(f"\nAI Features:")
+        print(f"Web Search Queries: {self.search_queries_made}")
+        print(f"Conversation Turns: {len(self.response_generator.conversation_context.conversation_history)}")
+        
+        # Pi hardware stats
         try:
-            self.audio_queue.put(None)
-            self.response_queue.put(None)
-            time.sleep(2)  # Allow final processing
+            # CPU temperature
+            with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                temp_c = int(f.read().strip()) / 1000
+            print(f"\nPi Hardware:")
+            print(f"CPU Temperature: {temp_c:.1f}°C")
+            
+            # Memory usage
+            with open('/proc/meminfo', 'r') as f:
+                meminfo = f.read()
+            mem_total = int([line for line in meminfo.split('\n') if 'MemTotal' in line][0].split()[1]) // 1024
+            mem_available = int([line for line in meminfo.split('\n') if 'MemAvailable' in line][0].split()[1]) // 1024
+            mem_used = mem_total - mem_available
+            mem_percent = (mem_used / mem_total) * 100
+            print(f"Memory Usage: {mem_used}MB / {mem_total}MB ({mem_percent:.1f}%)")
+            
+        except Exception as e:
+            print(f"Hardware stats error: {e}")
+        
+        print(f"{'='*50}")
+    
+    def pi_shutdown(self):
+        """Pi-optimized shutdown sequence"""
+        print("\nInitiating Pi system shutdown...")
+        self.is_running = False
+        
+        # Stop audio processing
+        self.stop_assistant_mode()
+        
+        # Cleanup TTS cache if needed
+        try:
+            self.tts_handler.cleanup_old_cache()
         except:
             pass
         
-        self.logger.info("âœ… Complete shutdown finished")
+        # Shutdown thread pools
+        print("Shutting down processing threads...")
+        self.transcription_executor.shutdown(wait=True)
+        self.llm_executor.shutdown(wait=True)
+        
+        # Final statistics
+        if self.response_times:
+            avg_response = np.mean(self.response_times)
+            success_rate = self.successful_interactions / max(1, self.successful_interactions + self.failed_interactions)
+            uptime = datetime.now() - self.response_generator.conversation_context.current_session_start
+            
+            print(f"\nFinal Pi Session Statistics:")
+            print(f"Total uptime: {str(uptime).split('.')[0]}")
+            print(f"Interactions processed: {self.successful_interactions}")
+            print(f"Success rate: {success_rate:.1%}")
+            print(f"Average response time: {avg_response:.2f}s")
+            print(f"Web searches performed: {self.search_queries_made}")
+        
+        print("Krishna AI Assistant for Raspberry Pi shutdown complete.")
+        print("Thank you for using Pi-optimized AI technology!")
 
-def select_initial_mode():
-    """Allow user to select initial mode"""
-    print("ðŸš€ Krishna Voice Assistant - Aerospace Grade with Sleep/Wake - OLLAMA POWERED")
-    print("=" * 70)
-    print("Select Initial Mode:")
-    print("1. TEST MODE - Manual interaction (recommended for testing)")
-    print("2. ASSISTANT MODE - Autonomous operation (NASA/ISRO style)")
-    print("\nNote: Say 'shutdown' to sleep, 'hello krishna' to wake up!")
-    print("Powered by Ollama for advanced AI responses!")
-    print("=" * 70)
+def check_pi_requirements():
+    """Check Pi system requirements and dependencies"""
+    print("Checking Raspberry Pi system requirements...")
     
-    while True:
+    # Check Python version
+    if sys.version_info < (3, 7):
+        print("Warning: Python 3.7+ recommended for optimal performance")
+    
+    # Check for required packages
+    required_packages = [
+        ('sounddevice', 'sounddevice'),
+        ('numpy', 'numpy'),
+        ('whisper', 'openai-whisper'),
+        ('ctransformers', 'ctransformers'),
+        ('gtts', 'gTTS'),
+        ('pygame', 'pygame'),
+        ('requests', 'requests')
+    ]
+    
+    missing_packages = []
+    for package, pip_name in required_packages:
         try:
-            choice = input("Enter choice (1 for Test, 2 for Assistant): ").strip()
-            if choice == '1':
-                return "TEST"
-            elif choice == '2':
-                return "ASSISTANT"
-            else:
-                print("âŒ Invalid choice. Please enter 1 or 2.")
-        except KeyboardInterrupt:
-            print("\nðŸ›‘ Startup cancelled")
-            sys.exit(0)
+            __import__(package)
+            print(f"✓ {package}")
+        except ImportError:
+            print(f"✗ {package} - Install with: pip install {pip_name}")
+            missing_packages.append(pip_name)
+    
+    if missing_packages:
+        print(f"\nTo install missing packages:")
+        print(f"pip install {' '.join(missing_packages)}")
+        return False
+    
+    # Check audio system
+    try:
+        devices = sd.query_devices()
+        input_devices = [d for d in devices if d['max_input_channels'] > 0]
+        if not input_devices:
+            print("Warning: No audio input devices found")
+        else:
+            print(f"✓ Found {len(input_devices)} audio input device(s)")
+    except Exception as e:
+        print(f"Audio system check failed: {e}")
+    
+    # Check available memory
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            meminfo = f.read()
+        mem_total = int([line for line in meminfo.split('\n') if 'MemTotal' in line][0].split()[1]) // 1024
+        print(f"✓ Available RAM: {mem_total}MB")
+        
+        if mem_total < 1024:
+            print("Warning: Less than 1GB RAM available. Performance may be limited.")
+    except:
+        print("Could not check memory information")
+    
+    return len(missing_packages) == 0
 
 def main():
-    """Main entry point with mode selection and Ollama verification"""
+    """Main entry point for Pi Krishna assistant"""
+    print("Initializing Krishna AI Assistant for Raspberry Pi...")
+    
+    # Check system requirements
+    if not check_pi_requirements():
+        print("\nPlease install missing requirements before running.")
+        return
+    
     try:
-        print("ðŸ” Checking Ollama connection before startup...")
-        
-        # Quick Ollama check
-        try:
-            response = requests.get("http://localhost:11434/api/tags", timeout=5)
-            if response.status_code != 200:
-                print("âŒ Ollama server not responding. Please run 'ollama serve' first.")
-                sys.exit(1)
-        except requests.exceptions.ConnectionError:
-            print("âŒ Cannot connect to Ollama. Please run 'ollama serve' first.")
-            print("ðŸ’¡ In a terminal, run: ollama serve")
-            print("ðŸ’¡ Then in another terminal, run: ollama run tinyllama")
-            sys.exit(1)
-        
-        print("âœ… Ollama connection verified!")
-        
-        # Select initial mode
-        initial_mode = select_initial_mode()
-        
-        # Initialize assistant
-        assistant = AerospaceVoiceAssistant()
-        
-        # Set initial mode
-        assistant.switch_mode(initial_mode)
-        
-        # Run session
-        assistant.run_dual_mode_session()
+        assistant = KrishnaRaspberryPiAssistant()
+        assistant.run_pi_session()
     
     except KeyboardInterrupt:
-        print("\nðŸ›‘ Program interrupted by user")
-    
+        print("\nEmergency shutdown initiated")
     except Exception as e:
-        print(f"ðŸ’¥ CRITICAL ERROR: {e}")
+        print(f"Critical system error: {e}")
         traceback.print_exc()
-        sys.exit(1)
+        input("Press Enter to exit...")
 
 if __name__ == "__main__":
     main()
