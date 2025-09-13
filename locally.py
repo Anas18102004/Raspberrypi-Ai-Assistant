@@ -39,7 +39,14 @@ import sounddevice as sd
 import numpy as np
 import wave
 import whisper
-from ctransformers import AutoModelForCausalLM
+
+# LLM inference - using llama-cpp-python (more reliable for Pi)
+try:
+    from llama_cpp import Llama
+    LLAMA_CPP_AVAILABLE = True
+except ImportError:
+    LLAMA_CPP_AVAILABLE = False
+    print("Warning: llama-cpp-python not available. Install with: pip install llama-cpp-python")
 
 # gTTS for text-to-speech
 from gtts import gTTS
@@ -398,16 +405,25 @@ Context: {search_context}
 Respond helpfully in under 20 words:
 Krishna:"""
                 
-                response = self.llm(prompt)
+                # Generate response using llama-cpp-python
+                response = self.llm(
+                    prompt,
+                    max_tokens=Config.MAX_TOKENS,
+                    temperature=Config.TEMPERATURE,
+                    top_p=Config.TOP_P,
+                    stop=["Human:", "User:", "Krishna:", "\n", "Context:"]
+                )
+                response_text = response['choices'][0]['text']
+                
                 self.conversation_context.last_search_query = user_input
                 self.conversation_context.last_search_time = datetime.now()
                 
             else:
                 # Fallback to local response if search fails
-                response = self.generate_local_response(user_input)
-                response += " (Could not access online information.)"
+                response_text = self.generate_local_response(user_input)
+                response_text += " (Could not access online information.)"
             
-            return self.clean_response(response)
+            return self.clean_response(response_text)
             
         except Exception as e:
             logging.error(f"Search-enhanced response error: {e}")
@@ -425,8 +441,17 @@ User: {user_input}
 Respond naturally in under 20 words:
 Krishna:"""
             
-            response = self.llm(prompt)
-            return self.clean_response(response)
+            # Generate response using llama-cpp-python
+            response = self.llm(
+                prompt,
+                max_tokens=Config.MAX_TOKENS,
+                temperature=Config.TEMPERATURE,
+                top_p=Config.TOP_P,
+                stop=["Human:", "User:", "Krishna:", "\n", "Context:"]
+            )
+            response_text = response['choices'][0]['text']
+            
+            return self.clean_response(response_text)
             
         except Exception as e:
             logging.error(f"Local response error: {e}")
@@ -722,7 +747,7 @@ class KrishnaRaspberryPiAssistant:
             print(f"Audio device check failed: {e}")
     
     def initialize_models(self):
-        """Initialize AI models for Pi"""
+        """Initialize AI models for Pi using llama-cpp-python"""
         print("Loading AI models for Raspberry Pi (this will take a moment)...")
         
         # Load Whisper with tiny model
@@ -733,7 +758,7 @@ class KrishnaRaspberryPiAssistant:
             print(f"✗ Whisper loading failed: {e}")
             raise
         
-        # Load TinyLlama with Pi optimizations
+        # Load TinyLlama with llama-cpp-python (Pi optimized)
         try:
             if not os.path.exists(Config.TINYLLAMA_PATH):
                 print(f"Model not found at: {Config.TINYLLAMA_PATH}")
@@ -741,17 +766,24 @@ class KrishnaRaspberryPiAssistant:
                 print("Or update TINYLLAMA_PATH in Config class")
                 raise FileNotFoundError(f"Model not found: {Config.TINYLLAMA_PATH}")
             
-            self.llm = AutoModelForCausalLM.from_pretrained(
-                Config.TINYLLAMA_PATH,
-                max_new_tokens=Config.MAX_TOKENS,
-                temperature=Config.TEMPERATURE,
-                top_p=Config.TOP_P,
-                context_length=Config.CONTEXT_LENGTH,
-                threads=2,  # Reduced for Pi
-                repetition_penalty=Config.REPETITION_PENALTY,
-                stop=["Human:", "User:", "Krishna:", "\n"]
+            if not LLAMA_CPP_AVAILABLE:
+                print("llama-cpp-python not installed. Installing...")
+                print("Run: pip install llama-cpp-python")
+                raise ImportError("llama-cpp-python required but not installed")
+            
+            print("Loading TinyLlama model (this may take 1-2 minutes on Pi)...")
+            self.llm = Llama(
+                model_path=Config.TINYLLAMA_PATH,
+                n_ctx=Config.CONTEXT_LENGTH,  # Context window
+                n_threads=2,  # Optimized for Pi (adjust based on your Pi model)
+                n_batch=8,    # Small batch size for Pi
+                verbose=False,
+                n_gpu_layers=0,  # CPU only for Pi
+                use_mmap=True,   # Memory mapping for efficiency
+                use_mlock=False, # Don't lock memory on Pi
+                low_vram=True    # Use less VRAM/RAM
             )
-            print("✓ TinyLlama loaded (Pi optimized)")
+            print("✓ TinyLlama loaded with llama-cpp-python (Pi optimized)")
         except Exception as e:
             print(f"✗ TinyLlama loading failed: {e}")
             raise
@@ -1269,7 +1301,7 @@ def check_pi_requirements():
     required_packages = [
         ('sounddevice', 'sounddevice'),
         ('numpy', 'numpy'),
-        ('whisper', 'openai-whisper'),
+        ('faster_whisper', 'faster-whisper'),
         ('llama_cpp', 'llama-cpp-python'),
         ('gtts', 'gTTS'),
         ('pygame', 'pygame'),
