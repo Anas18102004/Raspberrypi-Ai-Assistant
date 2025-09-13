@@ -8,6 +8,7 @@ import json
 import subprocess
 import platform
 import requests
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple
@@ -21,16 +22,12 @@ import whisper
 
 # TTS Libraries (multiple redundancy layers)
 try:
-    import pyttsx3
-    PYTTSX3_AVAILABLE = True
-except ImportError:
-    PYTTSX3_AVAILABLE = False
-
-try:
     from gtts import gTTS
     import pygame
     GTTS_AVAILABLE = True
     pygame.mixer.init(frequency=22050, size=-16, channels=2, buffer=512)
+    pygame.init()  # Initialize pygame
+    pygame.mixer.music.set_volume(0.8)
 except ImportError:
     GTTS_AVAILABLE = False
 
@@ -143,49 +140,33 @@ class RedundantTTS:
     def initialize_engines(self):
         """Initialize all available TTS engines in priority order"""
         
-        # Priority 1: Windows SAPI (fastest, most reliable for Windows)
-        if SAPI_AVAILABLE and platform.system() == "Windows":
-            try:
-                engine = win32com.client.Dispatch("SAPI.SpVoice")
-                self.primary_engine = ("sapi", engine)
-                self.current_engine_type = "sapi"
-                self.logger.info("✅ Primary TTS: Windows SAPI initialized")
-            except Exception as e:
-                self.logger.error(f"SAPI initialization failed: {e}")
-        
-        # Priority 2: pyttsx3 (cross-platform, offline)
-        if PYTTSX3_AVAILABLE:
-            try:
-                engine = pyttsx3.init()
-                engine.setProperty('rate', 160)
-                engine.setProperty('volume', 0.9)
-                if not self.primary_engine:
-                    self.primary_engine = ("pyttsx3", engine)
-                    self.current_engine_type = "pyttsx3"
-                    self.logger.info("✅ Primary TTS: pyttsx3 initialized")
-                else:
-                    self.backup_engines.append(("pyttsx3", engine))
-                    self.logger.info("✅ Backup TTS: pyttsx3 ready")
-            except Exception as e:
-                self.logger.error(f"pyttsx3 initialization failed: {e}")
-        
-        # Priority 3: gTTS (requires internet, high quality)
+        # Priority 1: gTTS (high quality, requires internet)
         if GTTS_AVAILABLE:
             try:
                 # Test gTTS with a dummy call
                 test_tts = gTTS(text="test", lang='en', slow=False)
-                if not self.primary_engine:
-                    self.primary_engine = ("gtts", None)
-                    self.current_engine_type = "gtts"
-                    self.logger.info("✅ Primary TTS: gTTS initialized")
-                else:
-                    self.backup_engines.append(("gtts", None))
-                    self.logger.info("✅ Backup TTS: gTTS ready")
+                self.primary_engine = ("gtts", None)
+                self.current_engine_type = "gtts"
+                self.logger.info(" Primary TTS: gTTS initialized")
             except Exception as e:
                 self.logger.error(f"gTTS initialization failed: {e}")
         
+        # Priority 2: Windows SAPI (fastest, most reliable for Windows)
+        if SAPI_AVAILABLE and platform.system() == "Windows":
+            try:
+                engine = win32com.client.Dispatch("SAPI.SpVoice")
+                if not self.primary_engine:
+                    self.primary_engine = ("sapi", engine)
+                    self.current_engine_type = "sapi"
+                    self.logger.info(" Primary TTS: Windows SAPI initialized")
+                else:
+                    self.backup_engines.append(("sapi", engine))
+                    self.logger.info(" Backup TTS: Windows SAPI ready")
+            except Exception as e:
+                self.logger.error(f"SAPI initialization failed: {e}")
+        
         if not self.primary_engine:
-            raise RuntimeError("❌ CRITICAL: No TTS engines available!")
+            raise RuntimeError(" CRITICAL: No TTS engines available!")
     
     def speak(self, text: str, timeout: float = 10.0) -> bool:
         """Speak text with automatic failover"""
@@ -193,7 +174,7 @@ class RedundantTTS:
             return False
         
         text = text.strip()
-        self.logger.info(f"🗣️ Speaking: {text}")
+        self.logger.info(f" Speaking: {text}")
         
         # Try primary engine first
         if self._try_speak_with_engine(self.primary_engine, text, timeout):
@@ -211,7 +192,7 @@ class RedundantTTS:
                 return True
         
         # All engines failed
-        self.logger.error("❌ ALL TTS ENGINES FAILED")
+        self.logger.error(" ALL TTS ENGINES FAILED")
         return False
     
     def _try_speak_with_engine(self, engine_info: Tuple, text: str, timeout: float) -> bool:
@@ -223,37 +204,59 @@ class RedundantTTS:
                 engine.Speak(text)
                 return True
             
-            elif engine_type == "pyttsx3":
-                engine.say(text)
-                engine.runAndWait()
-                return True
-            
             elif engine_type == "gtts":
-                tts = gTTS(text=text, lang='en', slow=False)
-                audio_file = f"tts_temp_{int(time.time())}.mp3"
-                tts.save(audio_file)
-                
-                pygame.mixer.music.load(audio_file)
-                pygame.mixer.music.play()
-                
-                # Wait for completion with timeout
-                start_time = time.time()
-                while pygame.mixer.music.get_busy():
-                    if time.time() - start_time > timeout:
-                        pygame.mixer.music.stop()
-                        break
-                    time.sleep(0.1)
-                
-                # Cleanup
-                try:
-                    os.remove(audio_file)
-                except:
-                    pass
-                
-                return True
+                return self._speak_with_gtts(text, timeout)
         
         except Exception as e:
             self.logger.error(f"TTS engine {engine_type} failed: {e}")
+            return False
+        
+        return False
+    
+    def _speak_with_gtts(self, text: str, timeout: float) -> bool:
+        """Speak using Google Text-to-Speech"""
+        temp_filename = None
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as fp:
+                temp_filename = fp.name
+            
+            # Split long text into smaller chunks to avoid gTTS rate limits
+            max_chunk_length = 500
+            if len(text) > max_chunk_length:
+                chunks = [text[i:i+max_chunk_length] for i in range(0, len(text), max_chunk_length)]
+            else:
+                chunks = [text]
+            
+            # Generate and save each chunk
+            for i, chunk in enumerate(chunks):
+                tts = gTTS(text=chunk, lang='en', slow=False)
+                chunk_filename = f"{temp_filename}_{i}.mp3"
+                tts.save(chunk_filename)
+                
+                # Play the audio file using pygame
+                pygame.mixer.music.load(chunk_filename)
+                pygame.mixer.music.play()
+                
+                # Wait for the audio to finish playing
+                while pygame.mixer.music.get_busy():
+                    pygame.time.Clock().tick(10)
+                
+                # Clean up the chunk file
+                pygame.mixer.music.unload()
+                try:
+                    os.unlink(chunk_filename)
+                except:
+                    pass
+                
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"gTTS error: {e}")
+            if temp_filename and os.path.exists(temp_filename):
+                try:
+                    os.unlink(temp_filename)
+                except:
+                    pass
             return False
         
         return False
@@ -341,7 +344,7 @@ class OllamaLLM:
             if not test_response:
                 raise Exception("Test generation failed")
             
-            self.logger.info(f"✅ Ollama connected successfully with model: {self.model_name}")
+            self.logger.info(f"âœ… Ollama connected successfully with model: {self.model_name}")
             
         except requests.exceptions.ConnectionError:
             raise Exception("Ollama server not running. Please start with 'ollama serve'")
@@ -427,7 +430,7 @@ class AerospaceVoiceAssistant:
         # Start background processes
         self.start_background_threads()
         
-        self.logger.info("🚀 Krishna Voice Assistant - Aerospace Grade - DUAL MODE - ONLINE")
+        self.logger.info("ðŸš€ Krishna Voice Assistant - Aerospace Grade - DUAL MODE - ONLINE")
     
     def setup_logging(self):
         """Configure comprehensive logging with Unicode support"""
@@ -465,21 +468,21 @@ class AerospaceVoiceAssistant:
         """Filter to remove emojis for Windows console compatibility"""
         # Replace common emojis with text equivalents
         emoji_replacements = {
-            '✅': '[OK]',
-            '❌': '[ERROR]',
-            '📝': '[TRANSCRIBE]',
-            '🗣️': '[SPEAK]',
-            '💚': '[HEALTH]',
-            '🎙️': '[MIC]',
-            '🤖': '[ROBOT]',
-            '⚠️': '[WARNING]',
-            '🛑': '[STOP]',
-            '🚀': '[START]',
-            '🧠': '[AI]',
-            '💥': '[CRITICAL]',
-            '🔇': '[MUTE]',
-            '😴': '[SLEEP]',
-            '👂': '[LISTEN]'
+            'âœ…': '[OK]',
+            'âŒ': '[ERROR]',
+            'ðŸ“': '[TRANSCRIBE]',
+            'ðŸ—£ï¸': '[SPEAK]',
+            'ðŸ’š': '[HEALTH]',
+            'ðŸŽ™ï¸': '[MIC]',
+            'ðŸ¤–': '[ROBOT]',
+            'âš ï¸': '[WARNING]',
+            'ðŸ›‘': '[STOP]',
+            'ðŸš€': '[START]',
+            'ðŸ§ ': '[AI]',
+            'ðŸ’¥': '[CRITICAL]',
+            'ðŸ”‡': '[MUTE]',
+            'ðŸ˜´': '[SLEEP]',
+            'ðŸ‘‚': '[LISTEN]'
         }
         
         message = record.getMessage()
@@ -491,14 +494,14 @@ class AerospaceVoiceAssistant:
     
     def initialize_models(self):
         """Initialize AI models with error handling"""
-        self.logger.info("🧠 Initializing AI models...")
+        self.logger.info("ðŸ§  Initializing AI models...")
         
         # Initialize Whisper
         try:
             self.whisper_model = whisper.load_model(Config.WHISPER_MODEL)
-            self.logger.info("✅ Whisper model loaded successfully")
+            self.logger.info("âœ… Whisper model loaded successfully")
         except Exception as e:
-            self.logger.critical(f"❌ Failed to load Whisper model: {e}")
+            self.logger.critical(f"âŒ Failed to load Whisper model: {e}")
             raise
     
     def start_background_threads(self):
@@ -528,7 +531,7 @@ class AerospaceVoiceAssistant:
         self.current_mode = new_mode.upper()
         
         if old_mode != self.current_mode:
-            self.logger.info(f"🔄 Mode switched: {old_mode} → {self.current_mode}")
+            self.logger.info(f"ðŸ”„ Mode switched: {old_mode} â†’ {self.current_mode}")
             
             if self.current_mode == "ASSISTANT":
                 self.continuous_listening = True
@@ -547,7 +550,7 @@ class AerospaceVoiceAssistant:
         self.continuous_listening = False
         self.is_assistant_awake = False
         self.health_monitor.log_sleep_wake_cycle()
-        self.logger.info("😴 Entering sleep mode - Wake word detection active")
+        self.logger.info("ðŸ˜´ Entering sleep mode - Wake word detection active")
         
         if self.current_mode == "ASSISTANT":
             self.tts_system.speak("Entering sleep mode. Say 'Hello Krishna' to wake me up.")
@@ -560,7 +563,7 @@ class AerospaceVoiceAssistant:
         if self.current_mode == "ASSISTANT":
             self.continuous_listening = True
             self.is_assistant_awake = True
-        self.logger.info("👂 Waking up - Resuming normal operation")
+        self.logger.info("ðŸ‘‚ Waking up - Resuming normal operation")
         self.tts_system.speak("Hello! I'm awake and ready to assist you.")
     
     def check_for_wake_words(self, text: str) -> bool:
@@ -571,7 +574,7 @@ class AerospaceVoiceAssistant:
         text_lower = text.lower().strip()
         for wake_word in Config.ASSISTANT_WAKE_WORDS:
             if wake_word in text_lower:
-                self.logger.info(f"👂 Wake word detected: '{wake_word}' in '{text}'")
+                self.logger.info(f"ðŸ‘‚ Wake word detected: '{wake_word}' in '{text}'")
                 return True
         return False
     
@@ -582,7 +585,7 @@ class AerospaceVoiceAssistant:
                 if self.current_mode == "ASSISTANT":
                     if self.is_sleeping:
                         # Sleep mode - only listen for wake words
-                        print(f"\r😴 [SLEEP MODE] Listening for wake words... {datetime.now().strftime('%H:%M:%S')}", end="")
+                        print(f"\rðŸ˜´ [SLEEP MODE] Listening for wake words... {datetime.now().strftime('%H:%M:%S')}", end="")
                         
                         # Record audio with longer intervals
                         audio_data = self.record_audio_sleep_mode()
@@ -597,7 +600,7 @@ class AerospaceVoiceAssistant:
                         
                     elif self.continuous_listening and self.is_assistant_awake:
                         # Normal assistant mode
-                        print(f"\r🤖 [ASSISTANT MODE] Listening... {datetime.now().strftime('%H:%M:%S')}", end="")
+                        print(f"\rðŸ¤– [ASSISTANT MODE] Listening... {datetime.now().strftime('%H:%M:%S')}", end="")
                         
                         # Record audio automatically
                         audio_data = self.record_audio_advanced()
@@ -613,7 +616,7 @@ class AerospaceVoiceAssistant:
                 else:
                     # Test mode - check for sleep mode
                     if self.is_sleeping:
-                        print(f"\r😴 [TEST MODE - SLEEPING] Say 'Hello Krishna' to wake... {datetime.now().strftime('%H:%M:%S')}", end="")
+                        print(f"\rðŸ˜´ [TEST MODE - SLEEPING] Say 'Hello Krishna' to wake... {datetime.now().strftime('%H:%M:%S')}", end="")
                         
                         audio_data = self.record_audio_sleep_mode()
                         if audio_data is not None:
@@ -671,7 +674,7 @@ class AerospaceVoiceAssistant:
     def record_audio_advanced(self) -> Optional[np.ndarray]:
         """Advanced audio recording with VAD"""
         if self.current_mode == "TEST":
-            self.logger.info("🎙️ Starting manual audio capture...")
+            self.logger.info("ðŸŽ™ï¸ Starting manual audio capture...")
         
         try:
             # Dynamic recording with voice activity detection
@@ -709,8 +712,8 @@ class AerospaceVoiceAssistant:
                     # Visual feedback (only in test mode)
                     if self.current_mode == "TEST":
                         elapsed = time.time() - start_time
-                        energy_bar = "█" * min(20, int(chunk_energy * 1000))
-                        print(f"\r🎙️ Recording [{elapsed:.1f}s]: {energy_bar:<20}", end="")
+                        energy_bar = "â–ˆ" * min(20, int(chunk_energy * 1000))
+                        print(f"\rðŸŽ™ï¸ Recording [{elapsed:.1f}s]: {energy_bar:<20}", end="")
             
             if self.current_mode == "TEST":
                 print()  # New line after recording
@@ -728,7 +731,7 @@ class AerospaceVoiceAssistant:
                     self.logger.info("No speech detected in recording")
                 return None
             
-            self.logger.info(f"✅ Audio captured: {len(recording)/Config.SAMPLE_RATE:.1f}s")
+            self.logger.info(f"âœ… Audio captured: {len(recording)/Config.SAMPLE_RATE:.1f}s")
             return recording
             
         except Exception as e:
@@ -775,7 +778,7 @@ class AerospaceVoiceAssistant:
             # Lower confidence threshold for wake words when sleeping
             confidence_threshold = Config.WAKE_WORD_CONFIDENCE_THRESHOLD if self.is_sleeping else 0.3
             
-            self.logger.info(f"📝 Transcribed: '{text}' (confidence: {confidence:.2f})")
+            self.logger.info(f"ðŸ“ Transcribed: '{text}' (confidence: {confidence:.2f})")
             
             if confidence < confidence_threshold:
                 if self.current_mode == "TEST" and not self.is_sleeping:
@@ -933,7 +936,7 @@ class AerospaceVoiceAssistant:
                     if not success:
                         self.health_monitor.log_error("tts")
                         if self.current_mode == "TEST":
-                            print(f"🔇 TTS Failed - Text: {response}")
+                            print(f"ðŸ”‡ TTS Failed - Text: {response}")
                 
                 self.response_queue.task_done()
                 
@@ -950,13 +953,13 @@ class AerospaceVoiceAssistant:
                 status = self.health_monitor.get_status()
                 
                 if status["system_status"] == "DEGRADED":
-                    self.logger.warning("⚠️ System performance degraded")
+                    self.logger.warning("âš ï¸ System performance degraded")
                     if self.current_mode == "ASSISTANT" and not self.is_sleeping:
                         self.tts_system.speak("System performance degraded. Consider maintenance.")
                 
                 # Log periodic status
                 sleep_status = "SLEEPING" if self.is_sleeping else "AWAKE"
-                self.logger.info(f"💚 Health Check: {status['successful_interactions']} interactions, "
+                self.logger.info(f"ðŸ’š Health Check: {status['successful_interactions']} interactions, "
                                f"{status['success_rate']:.1%} success rate, Mode: {self.current_mode}, State: {sleep_status}")
                 
             except Exception as e:
@@ -964,7 +967,7 @@ class AerospaceVoiceAssistant:
     
     def run_dual_mode_session(self):
         """Main dual-mode session with sleep/wake support"""
-        print("🚀 Krishna Voice Assistant - Aerospace Grade - DUAL MODE with SLEEP/WAKE - OLLAMA POWERED")
+        print("ðŸš€ Krishna Voice Assistant - Aerospace Grade - DUAL MODE with SLEEP/WAKE - OLLAMA POWERED")
         print("Modes: [a] Assistant (Autonomous) | [t] Test (Manual)")
         print("Sleep/Wake: Say 'shutdown' to sleep | Say 'hello krishna' to wake")
         print("Test Mode Commands: [ENTER] Record | [s] Status | [h] Health | [q] Quit")
@@ -978,7 +981,7 @@ class AerospaceVoiceAssistant:
                 if self.current_mode == "ASSISTANT":
                     # Assistant mode - autonomous operation
                     if self.is_sleeping:
-                        print(f"\n😴 ASSISTANT MODE - SLEEPING")
+                        print(f"\nðŸ˜´ ASSISTANT MODE - SLEEPING")
                         print("The assistant is sleeping and listening for 'hello krishna' to wake up.")
                         print("Commands: [t] Switch to Test Mode | [w] Wake Up | [q] Quit")
                         
@@ -996,7 +999,7 @@ class AerospaceVoiceAssistant:
                         elif user_input == 'h':
                             self.print_detailed_health()
                     else:
-                        print(f"\n🤖 ASSISTANT MODE ACTIVE - Autonomous Operation")
+                        print(f"\nðŸ¤– ASSISTANT MODE ACTIVE - Autonomous Operation")
                         print("Commands: [t] Switch to Test Mode | [sleep] Put to Sleep | [s] Status | [q] Quit")
                         
                         user_input = input(f"[Assistant Mode - {'LISTENING' if self.continuous_listening else 'STANDBY'}]: ").strip().lower()
@@ -1016,7 +1019,7 @@ class AerospaceVoiceAssistant:
                 else:
                     # Test mode - manual operation
                     if self.is_sleeping:
-                        print(f"\n😴 TEST MODE - SLEEPING")
+                        print(f"\nðŸ˜´ TEST MODE - SLEEPING")
                         print("The system is sleeping and listening for 'hello krishna' to wake up.")
                         print("Commands: [a] Assistant Mode | [w] Wake Up | [q] Quit")
                         
@@ -1034,7 +1037,7 @@ class AerospaceVoiceAssistant:
                         elif user_input == 'h':
                             self.print_detailed_health()
                     else:
-                        print(f"\n🧪 TEST MODE ACTIVE - Manual Operation")
+                        print(f"\nðŸ§ª TEST MODE ACTIVE - Manual Operation")
                         user_input = input("\n[ENTER] Record | [a] Assistant Mode | [sleep] Sleep | [s] Status | [h] Health | [o] Ollama Test | [q] Quit: ").strip().lower()
                         
                         if user_input == 'q':
@@ -1069,18 +1072,18 @@ class AerospaceVoiceAssistant:
                             self.audio_queue.put(audio_data)
                             self.last_interaction = time.time()
                         else:
-                            print("❌ No valid audio captured")
+                            print("âŒ No valid audio captured")
                         
                         print("="*50)
         
         except KeyboardInterrupt:
-            print("\n🛑 Keyboard interrupt received")
+            print("\nðŸ›‘ Keyboard interrupt received")
             self.shutdown()
     
     def test_ollama_direct(self):
         """Test Ollama connection directly"""
         print("\n" + "="*50)
-        print("🧪 OLLAMA DIRECT TEST")
+        print("ðŸ§ª OLLAMA DIRECT TEST")
         print("="*50)
         
         test_prompt = "Hello, this is a connection test"
@@ -1089,12 +1092,12 @@ class AerospaceVoiceAssistant:
         try:
             response = self.llm.generate(test_prompt)
             if response:
-                print(f"✅ Ollama Response: '{response}'")
+                print(f"âœ… Ollama Response: '{response}'")
                 self.tts_system.speak(response)
             else:
-                print("❌ Ollama test failed - no response")
+                print("âŒ Ollama test failed - no response")
         except Exception as e:
-            print(f"❌ Ollama test error: {e}")
+            print(f"âŒ Ollama test error: {e}")
             self.logger.error(f"Ollama direct test failed: {e}")
         
         print("="*50)
@@ -1106,7 +1109,7 @@ class AerospaceVoiceAssistant:
         listening_status = "ACTIVE" if self.continuous_listening else "INACTIVE"
         
         print(f"\n{'='*50}")
-        print(f"🤖 KRISHNA STATUS REPORT")
+        print(f"ðŸ¤– KRISHNA STATUS REPORT")
         print(f"{'='*50}")
         print(f"Current Mode: {self.current_mode}")
         print(f"System State: {sleep_status}")
@@ -1125,7 +1128,7 @@ class AerospaceVoiceAssistant:
         """Print detailed health information"""
         status = self.health_monitor.get_status()
         print(f"\n{'='*60}")
-        print(f"🏥 DETAILED SYSTEM HEALTH")
+        print(f"ðŸ¥ DETAILED SYSTEM HEALTH")
         print(f"{'='*60}")
         for key, value in status.items():
             print(f"{key.replace('_', ' ').title()}: {value}")
@@ -1135,7 +1138,7 @@ class AerospaceVoiceAssistant:
     
     def shutdown(self):
         """Graceful shutdown - completely terminates the program"""
-        self.logger.info("🛑 Initiating graceful shutdown...")
+        self.logger.info("ðŸ›‘ Initiating graceful shutdown...")
         self.is_running = False
         self.continuous_listening = False
         
@@ -1155,11 +1158,11 @@ class AerospaceVoiceAssistant:
         except:
             pass
         
-        self.logger.info("✅ Complete shutdown finished")
+        self.logger.info("âœ… Complete shutdown finished")
 
 def select_initial_mode():
     """Allow user to select initial mode"""
-    print("🚀 Krishna Voice Assistant - Aerospace Grade with Sleep/Wake - OLLAMA POWERED")
+    print("ðŸš€ Krishna Voice Assistant - Aerospace Grade with Sleep/Wake - OLLAMA POWERED")
     print("=" * 70)
     print("Select Initial Mode:")
     print("1. TEST MODE - Manual interaction (recommended for testing)")
@@ -1176,29 +1179,29 @@ def select_initial_mode():
             elif choice == '2':
                 return "ASSISTANT"
             else:
-                print("❌ Invalid choice. Please enter 1 or 2.")
+                print("âŒ Invalid choice. Please enter 1 or 2.")
         except KeyboardInterrupt:
-            print("\n🛑 Startup cancelled")
+            print("\nðŸ›‘ Startup cancelled")
             sys.exit(0)
 
 def main():
     """Main entry point with mode selection and Ollama verification"""
     try:
-        print("🔍 Checking Ollama connection before startup...")
+        print("ðŸ” Checking Ollama connection before startup...")
         
         # Quick Ollama check
         try:
             response = requests.get("http://localhost:11434/api/tags", timeout=5)
             if response.status_code != 200:
-                print("❌ Ollama server not responding. Please run 'ollama serve' first.")
+                print("âŒ Ollama server not responding. Please run 'ollama serve' first.")
                 sys.exit(1)
         except requests.exceptions.ConnectionError:
-            print("❌ Cannot connect to Ollama. Please run 'ollama serve' first.")
-            print("💡 In a terminal, run: ollama serve")
-            print("💡 Then in another terminal, run: ollama run tinyllama")
+            print("âŒ Cannot connect to Ollama. Please run 'ollama serve' first.")
+            print("ðŸ’¡ In a terminal, run: ollama serve")
+            print("ðŸ’¡ Then in another terminal, run: ollama run tinyllama")
             sys.exit(1)
         
-        print("✅ Ollama connection verified!")
+        print("âœ… Ollama connection verified!")
         
         # Select initial mode
         initial_mode = select_initial_mode()
@@ -1213,10 +1216,10 @@ def main():
         assistant.run_dual_mode_session()
     
     except KeyboardInterrupt:
-        print("\n🛑 Program interrupted by user")
+        print("\nðŸ›‘ Program interrupted by user")
     
     except Exception as e:
-        print(f"💥 CRITICAL ERROR: {e}")
+        print(f"ðŸ’¥ CRITICAL ERROR: {e}")
         traceback.print_exc()
         sys.exit(1)
 
