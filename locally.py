@@ -397,7 +397,7 @@ Krishna:"""
 
         try:
             while True:
-                user_input = input("\n[ENTER] Record | [s] Status | [t] Test | [q] Quit: ").strip().lower()
+                user_input = input("\n[ENTER] Record | [s] Status | [t] Test | [d] Debug | [q] Quit: ").strip().lower()
                 
                 if user_input == "q":
                     print("Shutting down Krishna...")
