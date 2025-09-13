@@ -5,24 +5,22 @@ import queue
 import sounddevice as sd
 import numpy as np
 import wave
-import pyttsx3
-import whisper
-import requests
 import logging
 from datetime import datetime
 import json
 from pathlib import Path
 import re
+import subprocess
+import shlex
+
+import whisper
+from ollama import Ollama
 
 # ---------------- CONFIGURATION ---------------- #
 class Config:
     # Paths for models
     WHISPER_MODEL_NAME = "base"
-    
-    # Ollama settings
-    OLLAMA_MODEL_NAME = "tinyllama"
-    OLLAMA_SERVER_URL = "http://localhost:11434"
-    
+
     # Audio settings
     AUDIO_FILE = "input.wav"
     RECORD_SECONDS = 5
@@ -30,17 +28,16 @@ class Config:
     SILENCE_THRESHOLD = 0.01
     MIN_RECORDING_LENGTH = 1
     MAX_SILENCE_DURATION = 2.0
-    
+
     # LLM settings
     MAX_LLM_TOKENS = 150
     TEMPERATURE = 0.7
-    TOP_P = 0.9
     MAX_RESPONSE_WORDS = 15
-    
+
     # Wake words and sleep words
     WAKE_WORDS = ["hey robot", "ok robot", "wake up", "hey krishna", "krishna"]
     SLEEP_WORDS = ["sleep", "go to sleep", "stop listening", "goodbye"]
-    
+
     # Conversation settings
     MAX_HISTORY = 3
     SESSION_FILE = "session_data.json"
@@ -49,7 +46,7 @@ class Config:
 def setup_logging():
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
-    
+
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
@@ -70,99 +67,129 @@ class KrishnaVoiceAssistant:
         self.cache = {}
         self.robot_awake = True
         self.last_response = ""
-        
+
         # Initialize queues
         self.audio_queue = queue.Queue()
         self.text_queue = queue.Queue()
-        
+
         # Initialize components
         self._initialize_tts()
         self._initialize_whisper()
         self._initialize_llm()
         self._load_session_data()
-    
+
+    # ---------------- TEXT-TO-SPEECH USING PICO ---------------- #
     def _initialize_tts(self):
+        """Check PicoTTS availability"""
         try:
-            self.engine = pyttsx3.init()
-            voices = self.engine.getProperty('voices')
-            if voices:
-                for voice in voices:
-                    if 'female' in voice.name.lower() or 'zira' in voice.name.lower():
-                        self.engine.setProperty('voice', voice.id)
-                        break
-                else:
-                    self.engine.setProperty('voice', voices[0].id)
-            self.engine.setProperty('rate', 160)
-            self.engine.setProperty('volume', 0.9)
-            logger.info("✓ TTS engine initialized")
+            subprocess.run(["pico2wave", "--version"], check=True, stdout=subprocess.DEVNULL)
+            logger.info("✔ PicoTTS available")
         except Exception as e:
-            logger.error(f"Failed to initialize TTS: {e}")
+            logger.error(f"PicoTTS not found: {e}")
             raise
-    
-    def _initialize_whisper(self):
-        try:
-            print("Loading Whisper model...")
-            self.whisper_model = whisper.load_model(self.config.WHISPER_MODEL_NAME)
-            logger.info("✓ Whisper model loaded")
-        except Exception as e:
-            logger.error(f"Failed to load Whisper model: {e}")
-            raise
-    
-    def _initialize_llm(self):
-        try:
-            response = requests.get(f"{self.config.OLLAMA_SERVER_URL}/models")
-            if response.status_code == 200:
-                models = response.json()
-                model_names = [model['name'] for model in models]
-                if self.config.OLLAMA_MODEL_NAME not in model_names:
-                    raise ValueError(f"Model {self.config.OLLAMA_MODEL_NAME} not found in Ollama.")
-                logger.info("✓ Ollama server is running and model is available")
-            else:
-                raise ConnectionError("Failed to connect to Ollama server.")
-        except Exception as e:
-            logger.error(f"Failed to connect to Ollama: {e}")
-            raise
-    
+
     def speak(self, text):
+        """Speak text using PicoTTS"""
         if not text or len(text.strip()) == 0:
             return
+
         text = self._clean_text_for_speech(text)
         self.last_response = text
         self.cache["last_response"] = text
         self.cache["last_response_time"] = datetime.now().isoformat()
-        
+
         print(f"🤖 Krishna: {text}")
         logger.info(f"Speaking: {text}")
-        
+
         try:
-            self.engine.say(text)
-            self.engine.runAndWait()
+            wav_file = "temp_speech.wav"
+            cmd = f'pico2wave -w {wav_file} "{text}" && aplay {wav_file}'
+            subprocess.run(cmd, shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            os.remove(wav_file)
         except Exception as e:
             logger.error(f"TTS error: {e}")
             print(f"Failed to speak: {text}")
-    
+
     def _clean_text_for_speech(self, text):
         text = re.sub(r'[*_\[\](){}]', '', text)
-        text = text.replace('&', 'and')
-        text = text.replace('%', 'percent')
+        text = text.replace('&', 'and').replace('%', 'percent')
         text = ' '.join(text.split())
         return text
-    
+
+    # ---------------- WHISPER ---------------- #
+    def _initialize_whisper(self):
+        try:
+            print("Loading Whisper model...")
+            self.whisper_model = whisper.load_model(self.config.WHISPER_MODEL_NAME)
+            logger.info("✔ Whisper model loaded")
+        except Exception as e:
+            logger.error(f"Failed to load Whisper model: {e}")
+            raise
+
+    def transcribe(self, audio_file):
+        try:
+            result = self.whisper_model.transcribe(audio_file, fp16=False, language="en", temperature=0.0)
+            text = result["text"].strip()
+            if text:
+                logger.info(f"Transcribed: {text}")
+            return text
+        except Exception as e:
+            logger.error(f"Transcription error: {e}")
+            return ""
+
+    # ---------------- LLM USING OLLAMA ---------------- #
+    def _initialize_llm(self):
+        try:
+            print("Initializing Ollama client...")
+            self.ollama_client = Ollama()
+            logger.info("✔ Ollama client ready")
+        except Exception as e:
+            logger.error(f"Failed to initialize Ollama: {e}")
+            raise
+
+    def _get_llm_response(self, text):
+        try:
+            prompt = self.build_context_prompt(text)
+            response = self.ollama_client.chat(
+                model="tinyllama",  # Must be installed locally in Ollama
+                prompt=prompt,
+                max_tokens=self.config.MAX_LLM_TOKENS,
+                temperature=self.config.TEMPERATURE
+            )
+            if response and "content" in response:
+                answer = response["content"].strip()
+                if len(answer) > 2:
+                    self.conversation_history.append({
+                        "human": text,
+                        "assistant": answer,
+                        "timestamp": datetime.now().isoformat()
+                    })
+                    if len(self.conversation_history) > self.config.MAX_HISTORY:
+                        self.conversation_history = self.conversation_history[-self.config.MAX_HISTORY:]
+                return answer
+        except Exception as e:
+            logger.error(f"Ollama error: {e}")
+            return "Sorry, I had a processing error."
+        return "I don't understand that."
+
+    # ---------------- AUDIO RECORDING ---------------- #
     def detect_silence(self, audio_data):
         rms = np.sqrt(np.mean(audio_data ** 2))
         return rms < self.config.SILENCE_THRESHOLD
-    
+
     def record_audio_smart(self, max_duration=None):
         if max_duration is None:
             max_duration = self.config.RECORD_SECONDS
-        print("🎙️ Recording... speak now!")
+
+        print("🎤 Recording... speak now!")
+
         try:
             recording = []
             chunk_duration = 0.1
             chunk_size = int(chunk_duration * self.config.SAMPLE_RATE)
             silence_duration = 0
             has_speech = False
-            
+
             with sd.InputStream(
                 samplerate=self.config.SAMPLE_RATE,
                 channels=1,
@@ -173,80 +200,42 @@ class KrishnaVoiceAssistant:
                     chunk, _ = stream.read(chunk_size)
                     chunk = chunk.flatten()
                     recording.extend(chunk)
-                    
                     if self.detect_silence(chunk):
                         silence_duration += chunk_duration
                     else:
                         silence_duration = 0
                         has_speech = True
-                    
                     if has_speech and silence_duration >= self.config.MAX_SILENCE_DURATION:
                         break
-                    
                     elapsed = time.time() - start_time
-                    status = "🔴 Speaking..." if not self.detect_silence(chunk) else "⚪ Waiting..."
+                    status = "🗣 Speaking..." if not self.detect_silence(chunk) else "⚡ Waiting..."
                     print(f"{status} {elapsed:.1f}s", end="\r")
-            
+
             recording = np.array(recording, dtype=np.float32)
             duration = len(recording) / self.config.SAMPLE_RATE
-            
             if duration < self.config.MIN_RECORDING_LENGTH:
-                print(f"\n⚠️ Recording too short ({duration:.1f}s)")
+                print(f"\n⚠ Recording too short ({duration:.1f}s)")
                 return False
-            
+
             if np.max(np.abs(recording)) > 0:
                 recording = recording / np.max(np.abs(recording)) * 0.8
-            
+
             recording_int16 = (recording * 32767).astype(np.int16)
             with wave.open(self.config.AUDIO_FILE, 'wb') as wf:
                 wf.setnchannels(1)
                 wf.setsampwidth(2)
                 wf.setframerate(self.config.SAMPLE_RATE)
                 wf.writeframes(recording_int16.tobytes())
-            
-            print(f"\n✓ Recording saved ({duration:.1f}s)")
+
+            print(f"\n✔ Recording saved ({duration:.1f}s)")
             return True
+
         except Exception as e:
             logger.error(f"Recording error: {e}")
             print(f"❌ Recording failed: {e}")
             return False
-    
-    def transcribe(self, audio_file):
-        try:
-            result = self.whisper_model.transcribe(
-                audio_file,
-                fp16=False,
-                language="en",
-                temperature=0.0
-            )
-            text = result["text"].strip()
-            
-            if "segments" in result and result["segments"]:
-                confidences = []
-                for seg in result["segments"]:
-                    if "no_speech_prob" in seg:
-                        confidences.append(1 - seg["no_speech_prob"])
-                if confidences:
-                    avg_confidence = np.mean(confidences)
-                    logger.info(f"Transcription confidence: {avg_confidence:.2f}")
-                    if avg_confidence < 0.5:
-                        logger.warning("Low confidence transcription, ignoring")
-                        return ""
-            
-            hallucinations = [
-                "thank you", "thanks for watching", "subscribe", "like and subscribe",
-                "music", "applause", "silence", "quiet", ".", "?", "!"
-            ]
-            
-            if text.lower().strip() in hallucinations:
-                logger.info("Filtering out likely hallucination")
-                return ""
-            
-            return text
-        except Exception as e:
-            logger.error(f"Transcription error: {e}")
-            return ""
-    
+
+    # ---------------- CONTEXT ---------------- #
     def build_context_prompt(self, current_text):
         context = ""
         if self.conversation_history:
@@ -254,125 +243,45 @@ class KrishnaVoiceAssistant:
             for exchange in self.conversation_history[-2:]:
                 context += f"Human: {exchange['human']}\nKrishna: {exchange['assistant']}\n"
             context += "\n"
-        
-        prompt = f"""You are Krishna, a helpful robot assistant. Keep responses very short (1 sentence, max 15 words).
+        prompt = f"""You are Krishna, a helpful robot assistant. Keep responses very short (max 15 words).
 Be natural, friendly, and conversational. Don't repeat the human's question.
 
 {context}Human: {current_text}
 Krishna:"""
-        
         return prompt
-    
+
+    # ---------------- INTENT HANDLER ---------------- #
     def handle_intent(self, text):
         text_lower = text.lower().strip()
-        
         if len(text.strip()) < 2:
             return None
-        
         if any(word in text_lower for word in self.config.SLEEP_WORDS):
             self.robot_awake = False
             return "Going to sleep. Say 'hey Krishna' to wake me up."
-        
         if any(word in text_lower for word in self.config.WAKE_WORDS):
             if not self.robot_awake:
                 self.robot_awake = True
                 return "Hello! I'm Krishna. How can I help?"
             else:
                 return "I'm here! What can I do for you?"
-        
         if not self.robot_awake:
             return None
-        
         if any(word in text_lower for word in ["time", "what time"]):
-            current_time = datetime.now().strftime("%I:%M %p")
-            return f"It's {current_time}."
-        
+            return f"It's {datetime.now().strftime('%I:%M %p')}."
         if "date" in text_lower or "today" in text_lower:
-            current_date = datetime.now().strftime("%A, %B %d")
-            return f"Today is {current_date}."
-        
-        if "weather" in text_lower:
-            return "I can't check weather, but try your weather app."
-        
-        if "repeat" in text_lower or "say that again" in text_lower:
+            return f"Today is {datetime.now().strftime('%A, %B %d')}."
+        if "repeat" in text_lower:
             return self.cache.get("last_response", "I have nothing to repeat.")
-        
         if any(word in text_lower for word in ["exit", "quit", "shutdown"]):
             return "EXIT"
-        
         if "clear history" in text_lower or "forget" in text_lower:
             self.conversation_history.clear()
             return "I've cleared our conversation history."
-        
-        if "help" in text_lower or "what can you do" in text_lower:
+        if "help" in text_lower:
             return "I can chat, tell time and date, or answer questions. Just talk to me!"
-        
         return self._get_llm_response(text)
-    
-    def _get_llm_response(self, text):
-        try:
-            prompt = self.build_context_prompt(text)
-            logger.info(f"Prompt length: {len(prompt)} characters")
 
-            payload = {
-                "model": self.config.OLLAMA_MODEL_NAME,
-                "prompt": prompt,
-                "max_tokens": self.config.MAX_LLM_TOKENS,
-                "temperature": self.config.TEMPERATURE,
-                "top_p": self.config.TOP_P,
-                "stop": ["Human:", "\n\n"]
-            }
-
-            response = requests.post(
-                f"{self.config.OLLAMA_SERVER_URL}/api/chat",
-                json=payload
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                reply = data.get("message", {}).get("content", "").strip()
-                reply = self._clean_llm_response(reply)
-                if reply:
-                    self.conversation_history.append({
-                        "human": text,
-                        "assistant": reply,
-                        "timestamp": datetime.now().isoformat()
-                    })
-                    if len(self.conversation_history) > self.config.MAX_HISTORY:
-                        self.conversation_history = self.conversation_history[-self.config.MAX_HISTORY:]
-                    return reply
-                return "I'm not sure I understand."
-            else:
-                logger.error(f"Ollama server error: {response.status_code}")
-                return "I'm having trouble connecting to the server."
-
-        except Exception as e:
-            logger.error(f"Ollama API error: {e}")
-            return "Sorry, I had a processing error."
-    
-    def _clean_llm_response(self, response):
-        prefixes = ["Krishna:", "Assistant:", "AI:", "Robot:", "Human:", "I think", "Well,"]
-        response = response.strip()
-        
-        for prefix in prefixes:
-            if response.startswith(prefix):
-                response = response[len(prefix):].strip()
-        
-        sentences = re.split(r'[.!?]+', response)
-        response = sentences[0].strip()
-        
-        words = response.split()
-        if len(words) > self.config.MAX_RESPONSE_WORDS:
-            response = ' '.join(words[:self.config.MAX_RESPONSE_WORDS])
-        
-        if response and response[-1] not in '.!?':
-            response += '.'
-        
-        response = re.sub(r'\b(um|uh|like|you know)\b', '', response, flags=re.IGNORECASE)
-        response = ' '.join(response.split())
-        
-        return response
-    
+    # ---------------- SESSION ---------------- #
     def _save_session_data(self):
         try:
             session_data = {
@@ -386,7 +295,7 @@ Krishna:"""
             logger.info("Session data saved")
         except Exception as e:
             logger.error(f"Failed to save session data: {e}")
-    
+
     def _load_session_data(self):
         try:
             if os.path.exists(self.config.SESSION_FILE):
@@ -398,23 +307,21 @@ Krishna:"""
                 logger.info("Session data loaded")
         except Exception as e:
             logger.error(f"Failed to load session data: {e}")
-    
+
+    # ---------------- WORKERS ---------------- #
     def process_audio_worker(self):
         while True:
             audio_file = self.audio_queue.get()
             if audio_file is None:
                 break
             transcription = self.transcribe(audio_file)
-            if transcription and len(transcription.strip()) > 1:
-                print(f"🗣️ You said: '{transcription}'")
-                logger.info(f"Transcribed: {transcription}")
+            if transcription:
+                print(f"📝 You said: '{transcription}'")
                 response = self.handle_intent(transcription)
                 if response:
                     self.text_queue.put(response)
-            else:
-                logger.info("No clear speech detected")
             self.audio_queue.task_done()
-    
+
     def process_text_worker(self):
         while True:
             text = self.text_queue.get()
@@ -426,21 +333,21 @@ Krishna:"""
                 os._exit(0)
             self.speak(text)
             self.text_queue.task_done()
-    
+
+    # ---------------- MAIN LOOP ---------------- #
     def run(self):
         print("🤖 Krishna Robot Assistant v2.0 Online")
         print("Commands: [ENTER] Record | [s] Status | [t] Test TTS | [q] Quit")
-        
+
         threading.Thread(target=self.process_audio_worker, daemon=True).start()
         threading.Thread(target=self.process_text_worker, daemon=True).start()
-        
+
         if self.robot_awake:
             self.speak("Hello! I'm Krishna, your robot assistant. Ready to help!")
 
         try:
             while True:
                 user_input = input("\n[ENTER] Record | [s] Status | [t] Test | [q] Quit: ").strip().lower()
-                
                 if user_input == "q":
                     print("Shutting down Krishna...")
                     break
@@ -464,6 +371,7 @@ Krishna:"""
             self._save_session_data()
             self.audio_queue.put(None)
             self.text_queue.put(None)
+
 
 # ---------------- MAIN EXECUTION ---------------- #
 if __name__ == "__main__":
