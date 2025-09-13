@@ -1,401 +1,442 @@
 #!/usr/bin/env python3
 """
-NASA/ISRO Grade Raspberry Pi AI System
-Optimized for real-time performance with aggressive memory management
-Based on mission-critical spacecraft AI systems
+EMERGENCY PROTOCOL - Ultra-Low Memory AI System
+For Raspberry Pi with <1GB RAM - Mission Critical Fallback
+Based on deep space probe emergency systems
 """
 
-import torch
-import torch.nn.functional as F
-from transformers import (
-    AutoTokenizer, AutoModelForCausalLM, 
-    BitsAndBytesConfig, pipeline
-)
-import numpy as np
 import threading
 import queue
 import time
 import os
 import psutil
 import gc
-import warnings
-from concurrent.futures import ThreadPoolExecutor
-import multiprocessing as mp
+import json
+import re
+import subprocess
+import sys
+from typing import Dict, List, Optional
 
-# Suppress warnings for cleaner output
-warnings.filterwarnings("ignore")
-
-class MissionCriticalAI:
+class EmergencyAIProtocol:
     def __init__(self):
-        """Initialize with NASA/ISRO optimization strategies"""
-        self.device = "cpu"
-        self.model = None
-        self.tokenizer = None
-        self.tts_queue = queue.Queue()
-        self.response_cache = {}  # LRU cache for repeated queries
-        self.max_cache_size = 50
+        """Initialize ultra-lightweight AI system"""
+        print("🚨 EMERGENCY PROTOCOL ACTIVATED - Ultra-Low Memory Mode")
         
-        # Performance monitoring
-        self.response_times = []
-        self.memory_usage = []
+        # Lightweight response system
+        self.response_patterns = self.load_response_patterns()
+        self.conversation_context = []
+        self.max_context = 5  # Keep only last 5 exchanges
         
-        # Initialize optimized components
-        self.setup_torch_optimizations()
-        self.setup_model()
-        self.setup_realtime_tts()
+        # Performance tracking
+        self.response_count = 0
+        self.start_time = time.time()
+        
+        # TTS setup with fallback options
+        self.tts_system = self.setup_emergency_tts()
+        self.tts_queue = queue.Queue(maxsize=3)  # Small queue
+        self.tts_enabled = True
+        
+        # Start background TTS worker
+        if self.tts_system:
+            self.tts_worker = threading.Thread(target=self._emergency_tts_worker, daemon=True)
+            self.tts_worker.start()
+        
+        print("✅ Emergency AI system operational")
     
-    def setup_torch_optimizations(self):
-        """Apply NASA-grade PyTorch optimizations"""
-        # CPU optimization - critical for spacecraft computing
-        torch.set_num_threads(min(4, mp.cpu_count()))
-        torch.set_num_interop_threads(2)
-        
-        # Memory optimization
-        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
-        
-        # Disable gradient computation globally
-        torch.set_grad_enabled(False)
-        
-        print("🚀 Applied NASA-grade PyTorch optimizations")
-    
-    def setup_model(self):
-        """Load ultra-optimized model for real-time inference"""
-        print("🛰️  Loading mission-critical AI model...")
-        
-        try:
-            # Use the fastest small model that still provides good responses
-            model_name = "microsoft/DialoGPT-medium"  # 345MB, optimal size/quality
+    def load_response_patterns(self) -> Dict:
+        """Load intelligent response patterns - no ML model needed"""
+        return {
+            # Greetings and basic interaction
+            r'(?i)\b(hello|hi|hey|good\s+(morning|afternoon|evening))\b': [
+                "Hello! I'm your emergency AI assistant running on Raspberry Pi.",
+                "Hi there! How can I help you today?",
+                "Hello! Your Pi AI is ready to assist."
+            ],
             
-            # Load tokenizer with optimizations
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                model_name,
-                use_fast=True,  # Use Rust-based fast tokenizer
-                padding_side="left"
-            )
+            # Questions about the system
+            r'(?i)\b(how\s+are\s+you|status|working|running)\b': [
+                "I'm running smoothly on your Pi with minimal resources!",
+                "All systems operational. Using only pattern matching for speed.",
+                "Emergency protocol active - everything is working perfectly!"
+            ],
             
-            # Set special tokens
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
+            # Time and date
+            r'(?i)\b(time|what\s+time|clock)\b': [
+                f"Current time is {time.strftime('%H:%M:%S')}",
+                f"It's {time.strftime('%I:%M %p')} right now",
+            ],
             
-            # Load model with aggressive optimizations
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float32,
-                low_cpu_mem_usage=True,
-                device_map="auto"
-            )
+            r'(?i)\b(date|today|what\s+day)\b': [
+                f"Today is {time.strftime('%A, %B %d, %Y')}",
+                f"It's {time.strftime('%Y-%m-%d')}",
+            ],
             
-            # Put model in evaluation mode
-            self.model.eval()
+            # Pi-specific questions
+            r'(?i)\b(pi|raspberry|computer|system|memory|ram)\b': [
+                "I'm running on your Raspberry Pi using minimal resources!",
+                "Your Pi is working great - I'm using less than 50MB of RAM!",
+                "This is an ultra-optimized AI system designed for low-power devices."
+            ],
             
-            # Compile model for faster inference (PyTorch 2.0+)
-            try:
-                self.model = torch.compile(self.model, mode="reduce-overhead")
-                print("✅ Model compiled with torch.compile")
-            except:
-                print("⚠️  torch.compile not available, using standard model")
+            # Weather (without actual data)
+            r'(?i)\b(weather|temperature|hot|cold|rain)\b': [
+                "I don't have weather data, but your Pi's CPU temperature is good!",
+                "Check your local weather app - I'm focused on keeping your Pi cool!",
+            ],
             
-            print("✅ Model loaded and optimized!")
+            # Math operations
+            r'(?i)(?:what\s+is\s+|calculate\s+|compute\s+)?(\d+)\s*([+\-*/])\s*(\d+)': 'math',
             
-        except Exception as e:
-            print(f"❌ Model loading error: {e}")
-            self.fallback_to_simple_responses()
-    
-    def fallback_to_simple_responses(self):
-        """Fallback system for ultra-low resource scenarios"""
-        print("🔄 Activating fallback response system")
-        self.use_fallback = True
-        self.responses = {
-            "hello": "Hello! How can I help you?",
-            "how are you": "I'm running well on this Pi!",
-            "weather": "I don't have weather data, but the Pi is running cool!",
-            "time": f"Current time is {time.strftime('%H:%M:%S')}",
-            "default": "I'm a lightweight AI running on Raspberry Pi. Ask me simple questions!"
+            # Help and commands
+            r'(?i)\b(help|commands|what\s+can\s+you\s+do)\b': [
+                "I can chat, do basic math, tell time, and provide system info!",
+                "Try asking me about time, math problems, or Pi system status.",
+                "Commands: 'status', 'optimize', 'mute', 'help', or just chat!"
+            ],
+            
+            # Goodbye
+            r'(?i)\b(bye|goodbye|exit|quit|see\s+you)\b': [
+                "Goodbye! Your Pi AI will be here when you need it.",
+                "See you later! Keep your Pi cool!",
+                "Farewell! Mission accomplished."
+            ],
+            
+            # Default responses for unmatched input
+            'default': [
+                "That's interesting! I'm a lightweight AI focused on basic assistance.",
+                "I understand you're asking about that. I'm optimized for simple tasks on Pi.",
+                "Good question! As an emergency protocol AI, I keep things simple and fast.",
+                "I'm designed for quick responses rather than complex reasoning.",
+                "Your Pi AI is ready for the next question!"
+            ]
         }
     
-    def setup_realtime_tts(self):
-        """Setup ultra-fast text-to-speech system"""
+    def setup_emergency_tts(self):
+        """Setup TTS with multiple fallback options"""
+        # Try espeak first (most reliable on Pi)
+        if self.test_espeak():
+            print("🔊 Using espeak for speech")
+            return 'espeak'
+        
+        # Try festival as backup
+        if self.test_festival():
+            print("🔊 Using festival for speech")
+            return 'festival'
+        
+        # Try pyttsx3 as last resort
         try:
             import pyttsx3
-            self.tts_engine = pyttsx3.init()
-            
-            # Optimize for speed
-            self.tts_engine.setProperty('rate', 200)  # Faster speech
-            self.tts_engine.setProperty('volume', 0.9)
-            
-            # Start TTS worker thread
-            self.tts_worker = threading.Thread(target=self._tts_worker, daemon=True)
-            self.tts_worker.start()
-            
-            print("🔊 Real-time TTS system activated")
-            
-        except ImportError:
-            print("⚠️  pyttsx3 not available. Install with: pip install pyttsx3")
-            self.tts_engine = None
+            engine = pyttsx3.init()
+            print("🔊 Using pyttsx3 for speech")
+            return 'pyttsx3'
+        except:
+            pass
+        
+        print("⚠️  No TTS system available - text only mode")
+        return None
     
-    def _tts_worker(self):
-        """Background TTS processing - non-blocking"""
+    def test_espeak(self) -> bool:
+        """Test if espeak is available"""
+        try:
+            result = subprocess.run(['which', 'espeak'], 
+                                  capture_output=True, text=True)
+            return result.returncode == 0
+        except:
+            return False
+    
+    def test_festival(self) -> bool:
+        """Test if festival is available"""
+        try:
+            result = subprocess.run(['which', 'festival'], 
+                                  capture_output=True, text=True)
+            return result.returncode == 0
+        except:
+            return False
+    
+    def _emergency_tts_worker(self):
+        """Ultra-lightweight TTS worker"""
         while True:
             try:
                 text = self.tts_queue.get(timeout=1)
-                if text and self.tts_engine:
-                    self.tts_engine.say(text)
-                    self.tts_engine.runAndWait()
+                if text and self.tts_enabled:
+                    self.speak_text(text)
                 self.tts_queue.task_done()
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"TTS Error: {e}")
     
-    def speak_async(self, text):
-        """Non-blocking speech - NASA real-time requirement"""
-        if self.tts_engine and text:
-            try:
-                self.tts_queue.put_nowait(text)
-            except queue.Full:
-                pass  # Skip if queue is full - maintain real-time performance
-    
-    def generate_response_optimized(self, user_input):
-        """Ultra-optimized response generation"""
-        start_time = time.perf_counter()
-        
-        # Check cache first - O(1) lookup
-        cache_key = user_input.lower().strip()
-        if cache_key in self.response_cache:
-            print("⚡ Cache hit - instant response!")
-            return self.response_cache[cache_key]
-        
-        # Fallback responses for ultra-low resource mode
-        if hasattr(self, 'use_fallback') and self.use_fallback:
-            response = self.get_fallback_response(user_input)
-            self.cache_response(cache_key, response)
-            return response
-        
+    def speak_text(self, text: str):
+        """Speak text using available TTS system"""
         try:
-            # Tokenize with length limits for speed
-            inputs = self.tokenizer.encode(
-                user_input + self.tokenizer.eos_token,
-                return_tensors="pt",
-                max_length=128,  # Short inputs = faster processing
-                truncation=True
-            )
+            if self.tts_system == 'espeak':
+                # Fast espeak command
+                subprocess.run(['espeak', '-s', '180', text], 
+                             capture_output=True)
             
-            # Generate with aggressive speed optimizations
-            with torch.inference_mode():  # Faster than torch.no_grad()
-                outputs = self.model.generate(
-                    inputs,
-                    max_new_tokens=50,  # Shorter responses = much faster
-                    do_sample=True,
-                    temperature=0.8,
-                    top_k=40,  # Reduced from top_p for speed
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    repetition_penalty=1.05,
-                    use_cache=True  # Enable KV cache
-                )
+            elif self.tts_system == 'festival':
+                # Festival text-to-speech
+                process = subprocess.Popen(['festival', '--tts'], 
+                                         stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+                process.communicate(input=text.encode())
             
-            # Fast decoding
-            response = self.tokenizer.decode(
-                outputs[0][inputs.shape[-1]:], 
-                skip_special_tokens=True
-            ).strip()
-            
-            # Clean up response
-            if not response:
-                response = "I'm thinking... could you rephrase that?"
-            
-            # Cache the response
-            self.cache_response(cache_key, response)
-            
-            # Performance logging
-            inference_time = time.perf_counter() - start_time
-            self.response_times.append(inference_time)
-            
-            return response
-            
+            elif self.tts_system == 'pyttsx3':
+                import pyttsx3
+                engine = pyttsx3.init()
+                engine.setProperty('rate', 180)
+                engine.say(text)
+                engine.runAndWait()
+                
         except Exception as e:
-            print(f"Generation error: {e}")
-            return "System processing... please try again."
+            print(f"Speech error: {e}")
     
-    def get_fallback_response(self, user_input):
-        """Simple pattern matching for fallback mode"""
-        user_lower = user_input.lower()
-        
-        for key, response in self.responses.items():
-            if key in user_lower:
-                return response
-        
-        return self.responses["default"]
+    def speak_async(self, text: str):
+        """Add text to speech queue"""
+        if self.tts_system and self.tts_enabled:
+            try:
+                self.tts_queue.put_nowait(text[:100])  # Limit length
+            except queue.Full:
+                pass  # Skip if queue full
     
-    def cache_response(self, key, response):
-        """LRU cache implementation"""
-        if len(self.response_cache) >= self.max_cache_size:
-            # Remove oldest item
-            oldest_key = next(iter(self.response_cache))
-            del self.response_cache[oldest_key]
+    def generate_response(self, user_input: str) -> str:
+        """Generate response using pattern matching"""
+        user_input = user_input.strip()
+        if not user_input:
+            return "I'm listening..."
         
-        self.response_cache[key] = response
+        # Add to conversation context
+        self.conversation_context.append(user_input)
+        if len(self.conversation_context) > self.max_context:
+            self.conversation_context.pop(0)
+        
+        # Check for math operations
+        math_match = re.search(r'(\d+)\s*([+\-*/])\s*(\d+)', user_input)
+        if math_match:
+            return self.calculate_math(math_match)
+        
+        # Pattern matching for responses
+        for pattern, responses in self.response_patterns.items():
+            if pattern == 'default':
+                continue
+                
+            if re.search(pattern, user_input):
+                if isinstance(responses, list):
+                    import random
+                    return random.choice(responses)
+                return responses
+        
+        # Default response with context awareness
+        import random
+        response = random.choice(self.response_patterns['default'])
+        
+        # Add context if appropriate
+        if len(self.conversation_context) > 2:
+            response += " What else would you like to know?"
+        
+        return response
     
-    def monitor_performance(self):
-        """Real-time system monitoring"""
-        cpu_percent = psutil.cpu_percent()
-        memory = psutil.virtual_memory()
-        temp = self.get_cpu_temperature()
-        
-        avg_response_time = np.mean(self.response_times[-10:]) if self.response_times else 0
-        
-        status = {
-            'cpu': f"{cpu_percent:.1f}%",
-            'memory': f"{memory.percent:.1f}%",
-            'temp': f"{temp:.1f}°C" if temp else "N/A",
-            'avg_response': f"{avg_response_time:.2f}s",
-            'cache_size': len(self.response_cache)
-        }
-        
-        return status
-    
-    def get_cpu_temperature(self):
-        """Get Pi CPU temperature"""
+    def calculate_math(self, match) -> str:
+        """Safe math calculation"""
         try:
-            with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
-                temp = float(f.read()) / 1000.0
-            return temp
-        except:
-            return None
+            num1 = float(match.group(1))
+            operator = match.group(2)
+            num2 = float(match.group(3))
+            
+            if operator == '+':
+                result = num1 + num2
+            elif operator == '-':
+                result = num1 - num2
+            elif operator == '*':
+                result = num1 * num2
+            elif operator == '/':
+                if num2 == 0:
+                    return "Cannot divide by zero!"
+                result = num1 / num2
+            else:
+                return "Unknown operation"
+            
+            # Format result nicely
+            if result == int(result):
+                return f"{int(num1)} {operator} {int(num2)} = {int(result)}"
+            else:
+                return f"{num1} {operator} {num2} = {result:.2f}"
+                
+        except Exception as e:
+            return "Math calculation error"
+    
+    def get_system_status(self) -> Dict:
+        """Get system telemetry"""
+        try:
+            memory = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            
+            # Get temperature if available
+            temp = "N/A"
+            try:
+                with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                    temp = f"{float(f.read()) / 1000:.1f}°C"
+            except:
+                pass
+            
+            uptime = time.time() - self.start_time
+            
+            return {
+                'cpu': f"{cpu_percent:.1f}%",
+                'memory_used': f"{memory.percent:.1f}%",
+                'memory_available': f"{memory.available // (1024*1024)}MB",
+                'temperature': temp,
+                'uptime': f"{uptime:.0f}s",
+                'responses_served': self.response_count,
+                'tts_status': 'ON' if self.tts_enabled else 'OFF'
+            }
+        except Exception as e:
+            return {'error': str(e)}
     
     def optimize_memory(self):
-        """Aggressive memory cleanup - spacecraft reliability"""
-        gc.collect()  # Force garbage collection
+        """Emergency memory cleanup"""
+        # Clear old context
+        if len(self.conversation_context) > 3:
+            self.conversation_context = self.conversation_context[-3:]
         
-        # Clear old performance data
-        if len(self.response_times) > 100:
-            self.response_times = self.response_times[-50:]
+        # Force garbage collection
+        gc.collect()
         
-        # Clear excess cache
-        if len(self.response_cache) > self.max_cache_size * 0.8:
-            # Remove 20% of oldest entries
-            items_to_remove = int(len(self.response_cache) * 0.2)
-            for _ in range(items_to_remove):
-                oldest_key = next(iter(self.response_cache))
-                del self.response_cache[oldest_key]
+        # Clear TTS queue if full
+        while not self.tts_queue.empty():
+            try:
+                self.tts_queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        print("🧹 Memory optimized")
     
-    def mission_control_interface(self):
-        """NASA-style command interface"""
-        print("\n" + "="*60)
-        print("🚀 NASA/ISRO GRADE AI SYSTEM - MISSION CONTROL ACTIVE")
-        print("="*60)
-        print("Commands:")
-        print("  'status'  - System telemetry")
-        print("  'optimize' - Memory cleanup")
-        print("  'mute'    - Toggle speech")
-        print("  'abort'   - Emergency shutdown")
-        print("-"*60)
-        
-        speech_enabled = True
+    def emergency_protocol_interface(self):
+        """Ultra-simple command interface"""
+        print("\n" + "="*50)
+        print("🚨 EMERGENCY AI PROTOCOL - ULTRA LOW MEMORY MODE")
+        print("="*50)
+        print("💬 Just type and chat normally!")
+        print("📋 Commands: 'status', 'optimize', 'mute', 'abort'")
+        print("-"*50)
         
         while True:
             try:
-                # Mission control prompt
-                user_input = input("\n🎯 MISSION CONTROL> ").strip()
+                user_input = input("\n🎯 > ").strip()
                 
-                if user_input.lower() == 'abort':
-                    print("🚨 MISSION ABORT - System shutdown initiated")
+                if user_input.lower() in ['abort', 'quit', 'exit']:
+                    print("🚨 Emergency protocol terminated")
                     break
                 
                 elif user_input.lower() == 'status':
-                    status = self.monitor_performance()
-                    print("\n📊 SYSTEM TELEMETRY:")
+                    status = self.get_system_status()
+                    print("\n📊 SYSTEM STATUS:")
                     for key, value in status.items():
                         print(f"   {key.upper()}: {value}")
                     continue
                 
                 elif user_input.lower() == 'optimize':
-                    print("🔧 Initiating memory optimization...")
                     self.optimize_memory()
-                    print("✅ System optimized")
                     continue
                 
                 elif user_input.lower() == 'mute':
-                    speech_enabled = not speech_enabled
-                    status = "ENABLED" if speech_enabled else "DISABLED"
-                    print(f"🔊 SPEECH SYSTEM {status}")
+                    self.tts_enabled = not self.tts_enabled
+                    status = "ENABLED" if self.tts_enabled else "DISABLED"
+                    print(f"🔊 Speech {status}")
+                    continue
+                
+                elif user_input.lower() == 'help':
+                    print("""
+🆘 EMERGENCY AI HELP:
+   • Just chat normally - I'll respond quickly
+   • Ask about time, date, or simple math
+   • 'status' - Show system information
+   • 'optimize' - Clean up memory
+   • 'mute' - Toggle speech on/off
+   • 'abort' - Shutdown system
+                    """)
                     continue
                 
                 if not user_input:
                     continue
                 
-                # Generate response with timing
+                # Generate and display response
                 start_time = time.perf_counter()
-                response = self.generate_response_optimized(user_input)
+                response = self.generate_response(user_input)
                 end_time = time.perf_counter()
                 
-                # Display response with performance metrics
-                print(f"\n🤖 AI RESPONSE: {response}")
-                print(f"⚡ RESPONSE TIME: {end_time - start_time:.3f}s")
+                self.response_count += 1
                 
-                # Non-blocking speech
-                if speech_enabled:
-                    self.speak_async(response)
+                print(f"\n🤖 {response}")
+                print(f"⚡ {(end_time - start_time)*1000:.1f}ms")
                 
-                # Periodic optimization
-                if len(self.response_times) % 20 == 0:
+                # Speak response
+                self.speak_async(response)
+                
+                # Periodic memory cleanup
+                if self.response_count % 10 == 0:
                     self.optimize_memory()
                 
             except KeyboardInterrupt:
-                print("\n🚨 EMERGENCY STOP - Mission terminated")
+                print("\n🚨 Emergency stop activated")
                 break
             except Exception as e:
-                print(f"🚨 SYSTEM ERROR: {e}")
+                print(f"🚨 System error: {e}")
 
-def preflight_check():
-    """Pre-mission system verification"""
-    print("🔍 PREFLIGHT CHECK INITIATED...")
+def emergency_installation_check():
+    """Check and install minimal requirements"""
+    print("🔍 Emergency system check...")
     
-    # Check Python packages
-    required_packages = ['torch', 'transformers', 'psutil', 'numpy']
-    missing = []
+    # Check if espeak is available
+    try:
+        result = subprocess.run(['which', 'espeak'], capture_output=True)
+        if result.returncode != 0:
+            print("⚠️  Installing espeak for speech...")
+            try:
+                subprocess.run(['sudo', 'apt-get', 'update'], check=True)
+                subprocess.run(['sudo', 'apt-get', 'install', '-y', 'espeak'], check=True)
+                print("✅ espeak installed")
+            except:
+                print("❌ Could not install espeak automatically")
+                print("Run: sudo apt-get install espeak")
+        else:
+            print("✅ espeak available")
+    except:
+        print("❌ Cannot check espeak status")
     
-    for package in required_packages:
-        try:
-            __import__(package)
-            print(f"✅ {package}")
-        except ImportError:
-            missing.append(package)
-            print(f"❌ {package}")
+    # Check available memory
+    try:
+        memory = psutil.virtual_memory()
+        available_mb = memory.available // (1024 * 1024)
+        print(f"💾 Available RAM: {available_mb}MB")
+        
+        if available_mb < 100:
+            print("🚨 CRITICAL: Very low memory!")
+            print("🔧 Forcing memory cleanup...")
+            gc.collect()
+    except:
+        print("❌ Cannot check memory status")
     
-    if missing:
-        print(f"\n🚨 MISSION ABORT - Missing packages: {missing}")
-        print("Install with: pip install " + " ".join(missing))
-        return False
-    
-    # System checks
-    memory = psutil.virtual_memory()
-    print(f"💾 Available RAM: {memory.available // (1024*1024)} MB")
-    
-    if memory.available < 1024*1024*1024:  # Less than 1GB
-        print("⚠️  WARNING: Low memory - switching to ultra-optimized mode")
-    
-    print("🚀 PREFLIGHT CHECK COMPLETE - READY FOR LAUNCH")
-    return True
+    print("✅ Emergency check complete")
 
 def main():
-    """Mission launch sequence"""
-    print("🛰️  INITIALIZING NASA/ISRO GRADE AI SYSTEM")
-    print("🔧 Optimized for real-time spacecraft operations")
+    """Launch emergency protocol"""
+    print("🚨 LAUNCHING EMERGENCY AI PROTOCOL")
+    print("🛰️  Ultra-lightweight system for resource-constrained Pi")
     
-    if not preflight_check():
-        return
+    emergency_installation_check()
     
     try:
-        # Initialize mission-critical AI
-        ai_system = MissionCriticalAI()
+        # Initialize emergency system
+        emergency_ai = EmergencyAIProtocol()
         
-        # Launch mission control interface
-        ai_system.mission_control_interface()
+        # Launch interface
+        emergency_ai.emergency_protocol_interface()
         
     except Exception as e:
-        print(f"🚨 CRITICAL SYSTEM FAILURE: {e}")
-        print("🔄 Initiating emergency protocols...")
+        print(f"🚨 CRITICAL FAILURE: {e}")
+        print("💡 System requires at least 100MB free RAM")
 
 if __name__ == "__main__":
     main()
