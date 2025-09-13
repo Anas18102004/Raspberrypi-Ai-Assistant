@@ -73,8 +73,8 @@ class ConversationContext:
 class Config:
     """Configuration optimized for Raspberry Pi"""
     
-    # Model path - adjust this for your Raspberry Pi setup
-    TINYLLAMA_PATH = "/home/pi/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+    # Model path - your specific TinyLlama model location
+    TINYLLAMA_PATH = "/home/anas/tinyllama/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
     
     # Audio Configuration - optimized for Pi
     SAMPLE_RATE = 16000
