@@ -1270,7 +1270,7 @@ def check_pi_requirements():
         ('sounddevice', 'sounddevice'),
         ('numpy', 'numpy'),
         ('whisper', 'openai-whisper'),
-        ('ctransformers', 'ctransformers'),
+        ('llama_cpp', 'llama-cpp-python'),
         ('gtts', 'gTTS'),
         ('pygame', 'pygame'),
         ('requests', 'requests')
