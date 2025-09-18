@@ -1,87 +1,132 @@
-#!/usr/bin/env python3
-import RPi.GPIO as GPIO
-import time
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>RC Car — Pi Controller</title>
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#0ea5a6;--text:#e6eef6}
+    body{margin:0;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto; background:linear-gradient(180deg,#071021,#082634);color:var(--text);display:flex;align-items:center;justify-content:center;height:100vh}
+    .app{width:96vw;max-width:520px;background:rgba(255,255,255,0.03);padding:16px;border-radius:12px;box-shadow:0 6px 30px rgba(0,0,0,0.6)}
+    h1{margin:0 0 8px;font-size:18px}
+    .controls{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+    .pad{display:flex;flex-direction:column;align-items:center;gap:8px}
+    .dir-row{display:flex;gap:8px;width:100%}
+    button{flex:1;padding:14px;border-radius:10px;border:0;background:linear-gradient(180deg,#0b7b74,#0a6b67);color:white;font-weight:600;font-size:16px;touch-action:none}
+    .stop{background:linear-gradient(180deg,#b91c1c,#8b1111)}
+    .status{margin-top:12px;display:flex;justify-content:space-between;align-items:center;font-size:14px}
+    .slider{width:100%}
+    .row{display:flex;gap:8px}
+    .small{font-size:12px;color:#9fb6bd}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <h1>RC Car — Pi Controller</h1>
 
-# Direction pins
-IN1 = 17  # Left forward
-IN2 = 18  # Left backward
-IN3 = 22  # Right forward
-IN4 = 23  # Right backward
+    <div class="controls">
+      <div class="pad" style="grid-column:1 / span 2">
+        <div class="dir-row" style="justify-content:center">
+          <button id="btn-forward">▲ Forward</button>
+        </div>
+        <div class="dir-row">
+          <button id="btn-left">◀ Left</button>
+          <button id="btn-right">Right ▶</button>
+        </div>
+        <div class="dir-row" style="justify-content:center">
+          <button class="stop" id="btn-back">▼ Back</button>
+        </div>
+      </div>
 
-# Enable pins (PWM)
-ENA = 27  # Left enable
-ENB = 24  # Right enable
+      <div style="grid-column:1 / span 2">
+        <label class="small">Speed: <span id="speed-val">80</span>%</label>
+        <input id="speed" type="range" min="0" max="100" value="80" class="slider">
+      </div>
 
-GPIO.setmode(GPIO.BCM)
-GPIO.setwarnings(False)
+      <div style="grid-column:1 / span 2; display:flex; gap:8px;">
+        <button id="btn-stop" style="flex:1; background:#e11d48">Stop</button>
+        <button id="btn-sync" style="flex:1; background:#06b6d4">Sync</button>
+      </div>
 
-for pin in (IN1, IN2, IN3, IN4, ENA, ENB):
-    GPIO.setup(pin, GPIO.OUT)
+      <div class="status" style="grid-column:1 / span 2">
+        <div>Left: <span id="left-speed">—</span>%</div>
+        <div>Right: <span id="right-speed">—</span>%</div>
+      </div>
 
-# Create PWM objects at 1000 Hz
-pwm_left = GPIO.PWM(ENA, 1000)
-pwm_right = GPIO.PWM(ENB, 1000)
+    </div>
+    <p class="small" style="margin-top:8px">Hold button (touch or mouse) to continue motion. Release to stop. Use on a trusted LAN only.</p>
+  </div>
 
-pwm_left.start(0)   # 0% duty initially
-pwm_right.start(0)
+  <script>
+    const api = path => fetch(path, { method: 'POST' }).catch(e => console.log(e));
+    const get = path => fetch(path).then(r=>r.json()).catch(()=>({}));
 
-def set_speed(left_speed=100, right_speed=100):
-    """Set speed 0ï¿½100% for left and right motors."""
-    pwm_left.ChangeDutyCycle(left_speed)
-    pwm_right.ChangeDutyCycle(right_speed)
+    const btnForward = document.getElementById('btn-forward');
+    const btnBack = document.getElementById('btn-back');
+    const btnLeft = document.getElementById('btn-left');
+    const btnRight = document.getElementById('btn-right');
+    const btnStop = document.getElementById('btn-stop');
+    const btnSync = document.getElementById('btn-sync');
+    const speedSlider = document.getElementById('speed');
+    const speedVal = document.getElementById('speed-val');
+    const leftSpeedEl = document.getElementById('left-speed');
+    const rightSpeedEl = document.getElementById('right-speed');
 
-def stop():
-    GPIO.output(IN1, 0); GPIO.output(IN2, 0)
-    GPIO.output(IN3, 0); GPIO.output(IN4, 0)
-    set_speed(0, 0)
+    let holdTimer = null;
 
-def forward(t=2, speed=80):
-    set_speed(speed, speed)
-    GPIO.output(IN1, 1); GPIO.output(IN2, 0)
-    GPIO.output(IN3, 1); GPIO.output(IN4, 0)
-    time.sleep(t); stop()
+    function setSpeedRemote(left, right) {
+      fetch('/api/speed', {
+        method:'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ left, right })
+      });
+    }
 
-def backward(t=2, speed=80):
-    set_speed(speed, speed)
-    GPIO.output(IN1, 0); GPIO.output(IN2, 1)
-    GPIO.output(IN3, 0); GPIO.output(IN4, 1)
-    time.sleep(t); stop()
+    function attachHold(button, endpoint) {
+      const start = (ev) => {
+        ev.preventDefault();
+        api(endpoint);
+      };
+      const stop = (ev) => {
+        ev && ev.preventDefault();
+        api('/api/stop');
+      };
+      button.addEventListener('touchstart', start);
+      button.addEventListener('mousedown', start);
+      button.addEventListener('touchend', stop);
+      button.addEventListener('mouseup', stop);
+      button.addEventListener('mouseleave', stop);
+      // for keyboard accessibility
+      button.addEventListener('keydown', (e)=>{ if(e.key===' '||e.key==='Enter') start(e); });
+      button.addEventListener('keyup', stop);
+    }
 
-def left(t=1, speed=80):
-    # Left motors backward, right motors forward
-    set_speed(speed, speed)
-    GPIO.output(IN1, 0); GPIO.output(IN2, 1)
-    GPIO.output(IN3, 1); GPIO.output(IN4, 0)
-    time.sleep(t); stop()
+    attachHold(btnForward, '/api/forward');
+    attachHold(btnBack, '/api/backward');
+    attachHold(btnLeft, '/api/left');
+    attachHold(btnRight, '/api/right');
 
-def right(t=1, speed=80):
-    # Left motors forward, right motors backward
-    set_speed(speed, speed)
-    GPIO.output(IN1, 1); GPIO.output(IN2, 0)
-    GPIO.output(IN3, 0); GPIO.output(IN4, 1)
-    time.sleep(t); stop()
+    btnStop.addEventListener('click', ()=>api('/api/stop'));
 
-if __name__ == "__main__":
-    try:
-        print("Forward")
-        forward(2, 80)
-        time.sleep(1)
+    speedSlider.addEventListener('input', (e)=>{
+      const v = e.target.value;
+      speedVal.textContent = v;
+      // keep both sides same speed by default
+      setSpeedRemote(v, v);
+    });
 
-        print("Backward")
-        backward(2, 80)
-        time.sleep(1)
+    btnSync.addEventListener('click', async ()=>{
+      const st = await get('/api/status');
+      const ls = st.left_speed ?? 0;
+      const rs = st.right_speed ?? 0;
+      leftSpeedEl.textContent = ls;
+      rightSpeedEl.textContent = rs;
+      speedSlider.value = Math.round((ls+rs)/2);
+      speedVal.textContent = speedSlider.value;
+    });
 
-        print("Left")
-        left(1, 80)
-        time.sleep(1)
-
-        print("Right")
-        right(1, 80)
-        time.sleep(1)
-
-    finally:
-        stop()
-        pwm_left.stop()
-        pwm_right.stop()
-        GPIO.cleanup()
-        print("GPIO cleaned up.")
+    // initial sync
+    btnSync.click();
+  </script>
+</body>
+</html>
